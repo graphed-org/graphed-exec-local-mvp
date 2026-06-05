@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "graphed-exec-local"
+version = "0.0.1"
+description = "graphed M7: reference local executors (thread-pool AND process-pool), tree reduction, open_once"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "graphed-org" }]
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+# graphed-core (the execution contract) + graphed-debug (StageError) + graphed (Session); from git.
+dependencies = ["graphed-core", "graphed-debug", "graphed"]
+
+[project.optional-dependencies]
+# the backends + corpus are only needed to exercise realistic HEP analyses end-to-end in the suite
+dev = [
+  "pytest",
+  "pytest-xdist",
+  "hypothesis",
+  "mypy",
+  "ruff",
+  "graphed-numpy",
+  "graphed-awkward",
+  "graphed-corpus",
+  "numpy>=1.24",
+  "awkward>=2.6",
+]
+docs = ["sphinx", "furo"]
+
+[project.urls]
+Homepage = "https://github.com/graphed-org/graphed-exec-local"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/graphed_exec_local"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests/frozen/m7"]
+addopts = "-q"
+
+[tool.coverage.run]
+branch = true
+source = ["graphed_exec_local"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+
+[tool.ruff]
+line-length = 110
+src = ["src", "tests"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF", "PLC0415"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["awkward.*", "numpy.*", "graphed_awkward.*", "graphed_numpy.*", "graphed_corpus.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
