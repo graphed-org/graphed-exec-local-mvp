@@ -37,7 +37,7 @@ dev = [
 docs = ["sphinx", "furo"]
 
 [project.urls]
-Homepage = "https://github.com/graphed-org/graphed-exec-local"
+Homepage = "https://github.com/graphed-org/graphed-exec-local-mvp"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/graphed_exec_local"]
