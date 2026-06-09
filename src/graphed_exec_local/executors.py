@@ -30,7 +30,7 @@ from typing import TypeVar, cast
 
 from graphed_core import ExecContext, ExecResult, Partition, Plan, StopReason
 
-from ._reduce import running_fold, tree_reduce
+from ._reduce import plan_tree, running_fold, tree_reduce
 from .resources import LocalResources
 
 R = TypeVar("R")
@@ -62,12 +62,30 @@ def _proc_task(process: Callable[[Partition, LocalResources], object], partition
     return process(partition, _proc_resources)
 
 
-class _BaseExecutor:
-    """Shared driver. Subclasses supply the worker pool + the (picklable) worker entry point."""
+def _combine_task(combine: Callable[[object, object], object], a: object, b: object) -> object:
+    """Pool entry for a pooled combine (module-level so a spawned process can import it)."""
+    return combine(a, b)
 
-    def __init__(self, max_workers: int | None = None, *, on_combine: Callable[[int], None] | None = None):
+
+class _BaseExecutor:
+    """Shared driver. Subclasses supply the worker pool + the (picklable) worker entry point.
+
+    ``pooled_combines=True`` (M10) schedules the tree-reduce combines onto the SAME worker pool as
+    the leaves, instead of running them serially on the driver thread — for heavy partials (large
+    histograms, many partitions) the driver otherwise becomes a serial combine bottleneck. The
+    combine pairing is the same fixed `plan_tree`, so results stay bit-identical; with a process
+    pool, `plan.combine` must be picklable (module-level), exactly like `plan.process`."""
+
+    def __init__(
+        self,
+        max_workers: int | None = None,
+        *,
+        on_combine: Callable[[int], None] | None = None,
+        pooled_combines: bool = False,
+    ):
         self.max_workers = max_workers
         self._on_combine = on_combine  # test hook: called per tree-reduce combine with #leaves so far
+        self._pooled_combines = pooled_combines
 
     def _pool(self) -> _PoolExecutor:
         raise NotImplementedError
@@ -78,7 +96,50 @@ class _BaseExecutor:
     def run(self, plan: Plan[R]) -> ExecResult[R]:
         if plan.next_tasks is not None:
             return self._run_adaptive(plan)
+        if self._pooled_combines:
+            return self._run_fixed_pooled(plan)
         return self._run_fixed(plan)
+
+    def _run_fixed_pooled(self, plan: Plan[R]) -> ExecResult[R]:
+        tasks = sorted(plan.tasks, key=lambda t: t.key)  # deterministic leaf order
+        n = len(tasks)
+        if n == 0:
+            return ExecResult(plan.empty(), 0, 0, StopReason.EXHAUSTED)
+        combines, root = plan_tree(n)
+        assert root is not None  # n >= 1
+        waiting: dict[int, list[int]] = {}  # input node -> combine indices needing it
+        remaining: dict[int, set[int]] = {}  # combine index -> still-unready inputs
+        for ci, (_out, a, b) in enumerate(combines):
+            remaining[ci] = {a, b}
+            waiting.setdefault(a, []).append(ci)
+            waiting.setdefault(b, []).append(ci)
+
+        with self._pool() as pool:
+            node_of: dict[Future[object], int] = {
+                pool.submit(self._entry(), plan.process, t.partition): i for i, t in enumerate(tasks)
+            }
+            ready: dict[int, R] = {}
+            n_combines = 0
+            leaves_done = 0
+            while node_of:
+                done, _pending = wait(list(node_of), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    node = node_of.pop(fut)
+                    ready[node] = cast(R, fut.result())  # re-raises a worker error intact
+                    if node < n:
+                        leaves_done += 1
+                    for ci in waiting.get(node, ()):
+                        remaining[ci].discard(node)
+                        if not remaining[ci]:
+                            out, a, b = combines[ci]
+                            # a<b -> deterministic left/right grouping, same tree as the driver path
+                            combine = cast("Callable[[object, object], object]", plan.combine)
+                            f2 = pool.submit(_combine_task, combine, ready.pop(a), ready.pop(b))
+                            node_of[f2] = out
+                            n_combines += 1
+                            if self._on_combine is not None:
+                                self._on_combine(leaves_done)
+        return ExecResult(ready[root], n, n_combines, StopReason.EXHAUSTED)
 
     def _run_fixed(self, plan: Plan[R]) -> ExecResult[R]:
         tasks = sorted(plan.tasks, key=lambda t: t.key)  # deterministic leaf order
