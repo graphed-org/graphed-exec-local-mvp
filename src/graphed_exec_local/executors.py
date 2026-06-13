@@ -11,11 +11,13 @@ as-is, never degraded to an opaque string (plan A.3 #8).
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import hashlib
 import multiprocessing
 import os
 import pickle
+import queue
 import threading
 import time
 from collections import OrderedDict
@@ -31,10 +33,20 @@ from concurrent.futures import (
 from concurrent.futures import (
     Executor as _PoolExecutor,
 )
+from multiprocessing.managers import SyncManager
 from typing import TypeVar, cast
 
-from graphed_core import ExecContext, ExecResult, Partition, Plan, StopReason
-from graphed_core.execution import LocalResources
+from graphed_core import ExecContext, ExecResult, Partition, Plan, StopReason, Task
+from graphed_core.execution import (
+    LocalResources,
+    Monitor,
+    TaskEvent,
+    TaskPhase,
+    WorkerProfiler,
+    emit_task,
+    partition_label,
+)
+from graphed_debug import StageError
 
 from ._reduce import plan_tree, running_fold, tree_reduce
 
@@ -43,6 +55,37 @@ R = TypeVar("R")
 # ---- per-worker resources --------------------------------------------------
 _thread_local = threading.local()
 _proc_resources: LocalResources | None = None
+# M37: a worker->driver side channel for dashboard events (a bounded queue proxy, set by the
+# process pool initializer) + a per-worker statistical profiler. Both are None unless a Monitor is
+# attached. Emission is best-effort and MUST NOT block a worker (drop-on-full).
+_proc_event_q: object | None = None
+_proc_profiler: WorkerProfiler | None = None
+_MISSING = object()
+
+# M37: every statistical profiler we start (thread-local or per-process) is registered here so a
+# single atexit handler can stop it. pyinstrument's sampler timer otherwise outlives the worker and
+# raises "'NoneType' object is not callable" as module globals are torn down at interpreter exit.
+_live_profilers: list[WorkerProfiler] = []
+_profiler_lock = threading.Lock()
+_atexit_registered = False
+
+
+def _register_profiler(profiler: WorkerProfiler) -> None:
+    global _atexit_registered
+    with _profiler_lock:
+        _live_profilers.append(profiler)
+        if not _atexit_registered:
+            atexit.register(_stop_all_profilers)
+            _atexit_registered = True
+
+
+def _stop_all_profilers() -> None:
+    with _profiler_lock:
+        for profiler in _live_profilers:
+            with contextlib.suppress(Exception):
+                profiler.stop()
+        _live_profilers.clear()
+
 
 # M31: a process callable embedding a large compiled IR would otherwise be re-pickled and
 # re-shipped on EVERY submit (concurrent.futures does not dedupe callables). Instead it is
@@ -64,18 +107,111 @@ def _thread_resources() -> LocalResources:
     return res
 
 
-def _proc_init() -> None:
-    global _proc_resources
+def _proc_init(
+    profiler_factory: Callable[[], WorkerProfiler] | None = None,
+    event_q: object | None = None,
+) -> None:
+    global _proc_resources, _proc_event_q, _proc_profiler
     _proc_resources = LocalResources()
+    _proc_event_q = event_q
+    if profiler_factory is not None:
+        with contextlib.suppress(Exception):  # a profiler that won't start just disables sampling
+            prof = profiler_factory()
+            prof.start()
+            _proc_profiler = prof
+            _register_profiler(prof)  # stopped at worker-process exit (silences sampler teardown)
 
 
-def _thread_task(process: Callable[[Partition, LocalResources], object], partition: Partition) -> object:
-    return process(partition, _thread_resources())
+def _proc_emit(item: tuple[str, object]) -> None:
+    """Best-effort worker->driver put: a full queue drops the event (never blocks the worker)."""
+    q = _proc_event_q
+    if q is None:
+        return
+    with contextlib.suppress(Exception):
+        q.put_nowait(item)  # type: ignore[attr-defined]
 
 
-def _proc_task(process: Callable[[Partition, LocalResources], object], partition: Partition) -> object:
-    assert _proc_resources is not None  # set by the pool initializer
-    return process(partition, _proc_resources)
+def _run_with_emit(
+    process: Callable[[Partition, LocalResources], object],
+    task: Task,
+    resources: LocalResources,
+    *,
+    worker: str,
+    emit_event: Callable[[TaskEvent], None],
+    emit_profile: Callable[[str, bytes], None],
+    profiler: WorkerProfiler | None,
+) -> object:
+    """Run one task, emitting STARTED before and FINISHED/ERRORED after (worker-side timing), then
+    flushing the profiler. SUBMITTED is emitted driver-side. Emission is best-effort."""
+    label = partition_label(task.partition)
+    n = task.partition.n_entries
+    emit_event(TaskEvent(TaskPhase.STARTED, task.key, worker, time.perf_counter(), label, n))
+    try:
+        result = process(task.partition, resources)
+    except BaseException as exc:
+        emit_event(
+            TaskEvent(
+                TaskPhase.ERRORED, task.key, worker, time.perf_counter(), label, n, error=_render_error(exc)
+            )
+        )
+        raise
+    emit_event(TaskEvent(TaskPhase.FINISHED, task.key, worker, time.perf_counter(), label, n))
+    if profiler is not None:
+        with contextlib.suppress(Exception):
+            payload = profiler.flush()
+            if payload:
+                emit_profile(worker, payload)
+    return result
+
+
+def _render_error(exc: BaseException) -> str:
+    """A concise, picklable error summary for the dashboard. A graphed-debug ``StageError`` already
+    str()s to a user-source-mapped message (op + analysis line), so its own text is the best summary;
+    anything else gets a plain ``Type: message``."""
+    if isinstance(exc, StageError):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _thread_profiler(monitor: Monitor | None) -> WorkerProfiler | None:
+    """A per-thread profiler, built once from the monitor's factory and reused for this worker
+    thread's later tasks. ``None`` when no monitor or no factory (MVP tier)."""
+    if monitor is None:
+        return None
+    cached = getattr(_thread_local, "prof", _MISSING)
+    if cached is not _MISSING:
+        return cast("WorkerProfiler | None", cached)
+    prof: WorkerProfiler | None = None
+    with contextlib.suppress(Exception):
+        factory = monitor.worker_profiler_factory()
+        if factory is not None:
+            prof = factory()
+            prof.start()
+            _register_profiler(prof)  # stopped at process exit (silences sampler teardown)
+    _thread_local.prof = prof
+    return prof
+
+
+def _thread_task(
+    process: Callable[[Partition, LocalResources], object], task: Task, monitor: Monitor | None
+) -> object:
+    def emit_event(ev: TaskEvent) -> None:
+        emit_task(monitor, ev)
+
+    def emit_profile(worker: str, payload: bytes) -> None:
+        if monitor is not None:
+            with contextlib.suppress(Exception):
+                monitor.on_profile(worker, payload)
+
+    return _run_with_emit(
+        process,
+        task,
+        _thread_resources(),
+        worker=threading.current_thread().name,
+        emit_event=emit_event,
+        emit_profile=emit_profile,
+        profiler=_thread_profiler(monitor),
+    )
 
 
 def _prime_shared(token: str, payload: bytes) -> int:
@@ -92,10 +228,25 @@ def _prime_shared(token: str, payload: bytes) -> int:
     return os.getpid()
 
 
-def _proc_task_shared(token: str, partition: Partition) -> object:
+def _proc_task_shared(token: str, task: Task) -> object:
     assert _proc_resources is not None  # set by the pool initializer
     process = cast("Callable[[Partition, LocalResources], object]", _shared_objects[token])
-    return process(partition, _proc_resources)
+
+    def emit_event(ev: TaskEvent) -> None:
+        _proc_emit(("task", ev))
+
+    def emit_profile(worker: str, payload: bytes) -> None:
+        _proc_emit(("profile", (worker, payload)))
+
+    return _run_with_emit(
+        process,
+        task,
+        _proc_resources,
+        worker=str(os.getpid()),
+        emit_event=emit_event,
+        emit_profile=emit_profile,
+        profiler=_proc_profiler,
+    )
 
 
 def _combine_task(combine: Callable[[object, object], object], a: object, b: object) -> object:
@@ -119,6 +270,7 @@ class _BaseExecutor:
         on_combine: Callable[[int], None] | None = None,
         pooled_combines: bool = False,
         persistent: bool = False,
+        monitor: Monitor | None = None,
     ):
         self.max_workers = max_workers if max_workers is not None else (os.cpu_count() or 1)
         self._on_combine = on_combine  # test hook: called per tree-reduce combine with #leaves so far
@@ -130,16 +282,51 @@ class _BaseExecutor:
         self._broadcast_tokens: OrderedDict[str, None] = (
             OrderedDict()
         )  # M31/M34: primed tokens, FIFO-bounded in lockstep with each worker cache
+        self.monitor = monitor  # M37: a passive dashboard observer (None => no instrumentation)
 
     def _pool(self) -> _PoolExecutor:
         raise NotImplementedError
 
-    def _prepare(
+    def _raw_submit(
         self, pool: _PoolExecutor, process: Callable[[Partition, LocalResources], object]
-    ) -> Callable[[Partition], Future[object]]:
-        """Deliver ``process`` to the pool's workers as needed and return ``submit(partition)``.
+    ) -> Callable[[Task], Future[object]]:
+        """Deliver ``process`` to the pool's workers as needed and return ``submit(task)``.
         Threads share memory (no delivery); processes broadcast the process once (M31)."""
         raise NotImplementedError
+
+    def _prepare(
+        self, pool: _PoolExecutor, process: Callable[[Partition, LocalResources], object]
+    ) -> Callable[[Task], Future[object]]:
+        """Wrap the subclass submit with a driver-side SUBMITTED emission (M37). Worker-side STARTED/
+        FINISHED/ERRORED come from the worker entry; here we record the moment of submission."""
+        raw = self._raw_submit(pool, process)
+        monitor = self.monitor
+        if monitor is None:
+            return raw
+
+        def submit(task: Task) -> Future[object]:
+            emit_task(
+                monitor,
+                TaskEvent(
+                    TaskPhase.SUBMITTED,
+                    task.key,
+                    "driver",
+                    time.perf_counter(),
+                    partition_label(task.partition),
+                    task.partition.n_entries,
+                ),
+            )
+            return raw(task)
+
+        return submit
+
+    def _combine_cb(self, leaves_done: int) -> None:
+        """The tree-reduce combine callback: the legacy test hook AND the dashboard monitor (M37)."""
+        if self._on_combine is not None:
+            self._on_combine(leaves_done)
+        if self.monitor is not None:
+            with contextlib.suppress(Exception):
+                self.monitor.on_combine(leaves_done)
 
     @contextlib.contextmanager
     def _acquired_pool(self) -> Iterator[_PoolExecutor]:
@@ -189,7 +376,7 @@ class _BaseExecutor:
 
         with self._acquired_pool() as pool:
             submit = self._prepare(pool, plan.process)
-            node_of: dict[Future[object], int] = {submit(t.partition): i for i, t in enumerate(tasks)}
+            node_of: dict[Future[object], int] = {submit(t): i for i, t in enumerate(tasks)}
             ready: dict[int, R] = {}
             n_combines = 0
             leaves_done = 0
@@ -209,8 +396,7 @@ class _BaseExecutor:
                             f2 = pool.submit(_combine_task, combine, ready.pop(a), ready.pop(b))
                             node_of[f2] = out
                             n_combines += 1
-                            if self._on_combine is not None:
-                                self._on_combine(leaves_done)
+                            self._combine_cb(leaves_done)
         return ExecResult(ready[root], n, n_combines, StopReason.EXHAUSTED)
 
     def _run_fixed(self, plan: Plan[R]) -> ExecResult[R]:
@@ -220,14 +406,14 @@ class _BaseExecutor:
             return ExecResult(plan.empty(), 0, 0, StopReason.EXHAUSTED)
         with self._acquired_pool() as pool:
             submit = self._prepare(pool, plan.process)
-            leaf_of: dict[Future[object], int] = {submit(t.partition): i for i, t in enumerate(tasks)}
+            leaf_of: dict[Future[object], int] = {submit(t): i for i, t in enumerate(tasks)}
 
             def completed() -> Iterator[tuple[int, R]]:
                 for fut in as_completed(leaf_of):
                     yield leaf_of[fut], cast(R, fut.result())  # fut.result() re-raises a worker error
 
             value, n_combines = tree_reduce(
-                n, completed(), plan.combine, plan.empty, on_combine=self._on_combine
+                n, completed(), plan.combine, plan.empty, on_combine=self._combine_cb
             )
         return ExecResult(value, n, n_combines, StopReason.EXHAUSTED)
 
@@ -248,7 +434,7 @@ class _BaseExecutor:
                 if not batch:
                     return
                 for task in batch:
-                    fut = submit(task.partition)
+                    fut = submit(task)
                     submitted[fut] = (task.key, task.partition.n_entries, time.perf_counter())
 
             refill()
@@ -279,31 +465,125 @@ class ThreadExecutor(_BaseExecutor):
     def _pool(self) -> _PoolExecutor:
         return ThreadPoolExecutor(max_workers=self.max_workers)
 
-    def _prepare(
+    def _raw_submit(
         self, pool: _PoolExecutor, process: Callable[[Partition, LocalResources], object]
-    ) -> Callable[[Partition], Future[object]]:
-        return lambda partition: pool.submit(_thread_task, process, partition)
+    ) -> Callable[[Task], Future[object]]:
+        return lambda task: pool.submit(_thread_task, process, task, self.monitor)
 
 
 class ProcessExecutor(_BaseExecutor):
     """Process-pool executor: spawn-based worker processes (cross-platform + free-threaded-safe), each
     with its own ``open_once`` resources. The Plan ``process`` callable and its partials must be
-    picklable; a remote ``StageError`` round-trips to the driver intact."""
+    picklable; a remote ``StageError`` round-trips to the driver intact.
+
+    M37: when a :class:`Monitor` is attached, workers cannot reach the driver's monitor object, so
+    they push events onto a bounded ``Manager().Queue()`` that a driver-side **collector daemon
+    thread** drains and replays into the monitor. The queue is best-effort (drop-on-full) so
+    instrumentation never back-pressures a worker."""
+
+    def __init__(
+        self,
+        max_workers: int | None = None,
+        *,
+        on_combine: Callable[[int], None] | None = None,
+        pooled_combines: bool = False,
+        persistent: bool = False,
+        monitor: Monitor | None = None,
+    ):
+        super().__init__(
+            max_workers,
+            on_combine=on_combine,
+            pooled_combines=pooled_combines,
+            persistent=persistent,
+            monitor=monitor,
+        )
+        self._mgr: SyncManager | None = None
+        self._event_q: object | None = None
+        self._collector: threading.Thread | None = None
+        self._collector_stop: threading.Event | None = None
 
     def _pool(self) -> _PoolExecutor:
+        factory = self.monitor.worker_profiler_factory() if self.monitor is not None else None
         return ProcessPoolExecutor(
             max_workers=self.max_workers,
             mp_context=multiprocessing.get_context("spawn"),
             initializer=_proc_init,
+            initargs=(factory, self._event_q),
         )
 
-    def _prepare(
+    def _raw_submit(
         self, pool: _PoolExecutor, process: Callable[[Partition, LocalResources], object]
-    ) -> Callable[[Partition], Future[object]]:
+    ) -> Callable[[Task], Future[object]]:
         payload = pickle.dumps(process)  # pickled ONCE; the bytes are reused for the broadcast
         token = hashlib.sha256(payload).hexdigest()
         self._broadcast(pool, token, payload)
-        return lambda partition: pool.submit(_proc_task_shared, token, partition)
+        return lambda task: pool.submit(_proc_task_shared, token, task)
+
+    # ---- M37 dashboard collector (worker side-channel -> driver monitor) ----
+
+    @contextlib.contextmanager
+    def _acquired_pool(self) -> Iterator[_PoolExecutor]:
+        self._ensure_collector()
+        try:
+            with super()._acquired_pool() as pool:
+                yield pool
+        finally:
+            self._stop_collector()  # pool work is done -> drain remaining worker events, then join
+
+    def _ensure_collector(self) -> None:
+        if self.monitor is None:
+            return
+        if self._mgr is None:  # one manager + queue for this executor's lifetime
+            self._mgr = multiprocessing.get_context("spawn").Manager()
+            self._event_q = self._mgr.Queue(maxsize=10000)
+        self._collector_stop = threading.Event()
+        self._collector = threading.Thread(
+            target=self._collect_loop, name="graphed-dash-collector", daemon=True
+        )
+        self._collector.start()
+
+    def _collect_loop(self) -> None:
+        q = self._event_q
+        stop = self._collector_stop
+        assert q is not None and stop is not None
+        while not stop.is_set():
+            try:
+                item = q.get(timeout=0.05)  # type: ignore[attr-defined]
+            except queue.Empty:
+                continue
+            self._dispatch(item)
+        while True:  # final drain after the pool's work has settled
+            try:
+                item = q.get_nowait()  # type: ignore[attr-defined]
+            except queue.Empty:
+                break
+            self._dispatch(item)
+
+    def _dispatch(self, item: tuple[str, object]) -> None:
+        monitor = self.monitor
+        if monitor is None:
+            return
+        kind, payload = item
+        with contextlib.suppress(Exception):
+            if kind == "task":
+                monitor.on_task(cast("TaskEvent", payload))
+            elif kind == "profile":
+                worker, data = cast("tuple[str, bytes]", payload)
+                monitor.on_profile(worker, data)
+
+    def _stop_collector(self) -> None:
+        if self._collector is not None and self._collector_stop is not None:
+            self._collector_stop.set()
+            self._collector.join(timeout=5.0)
+            self._collector = None
+
+    def close(self) -> None:
+        super().close()
+        self._stop_collector()
+        if self._mgr is not None:
+            self._mgr.shutdown()
+            self._mgr = None
+            self._event_q = None
 
     def _broadcast(self, pool: _PoolExecutor, token: str, payload: bytes) -> None:
         """Prime every worker with ``payload`` exactly once. concurrent.futures exposes no worker

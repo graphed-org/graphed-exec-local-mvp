@@ -33,6 +33,7 @@ dev = [
   "graphed-corpus",
   "numpy>=1.24",
   "awkward>=2.6",
+  "pyinstrument>=5",
 ]
 docs = ["sphinx", "furo"]
 
@@ -44,7 +45,7 @@ packages = ["src/graphed_exec_local"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "tests/frozen/m7", "tests/frozen/m10", "tests/frozen/m31", "tests/frozen/m34"]
+pythonpath = ["src", "tests/frozen/m7", "tests/frozen/m10", "tests/frozen/m31", "tests/frozen/m34", "tests/frozen/m37"]
 addopts = "-q"
 
 [tool.coverage.run]
@@ -70,6 +71,13 @@ strict = true
 files = ["src"]
 
 [[tool.mypy.overrides]]
-module = ["awkward.*", "numpy.*", "graphed_awkward.*", "graphed_numpy.*", "graphed_corpus.*"]
+module = [
+  "awkward.*",
+  "numpy.*",
+  "graphed_awkward.*",
+  "graphed_numpy.*",
+  "graphed_corpus.*",
+  "graphed_debug.*",
+]
 ignore_missing_imports = true
 follow_imports = "skip"
