@@ -12,7 +12,10 @@ as-is, never degraded to an opaque string (plan A.3 #8).
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import multiprocessing
+import os
+import pickle
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -40,6 +43,12 @@ R = TypeVar("R")
 _thread_local = threading.local()
 _proc_resources: LocalResources | None = None
 
+# M31: a process callable embedding a large compiled IR would otherwise be re-pickled and
+# re-shipped on EVERY submit (concurrent.futures does not dedupe callables). Instead it is
+# broadcast to each worker ONCE, cached here by content hash, and tasks ship only (token,
+# partition). The cache is keyed by hash so re-running the same plan reuses the cached process.
+_shared_objects: dict[str, object] = {}
+
 
 def _thread_resources() -> LocalResources:
     res = getattr(_thread_local, "res", None)
@@ -60,6 +69,23 @@ def _thread_task(process: Callable[[Partition, LocalResources], object], partiti
 
 def _proc_task(process: Callable[[Partition, LocalResources], object], partition: Partition) -> object:
     assert _proc_resources is not None  # set by the pool initializer
+    return process(partition, _proc_resources)
+
+
+def _prime_shared(token: str, payload: bytes) -> int:
+    """Cache the broadcast process under ``token`` (idempotent); return this worker's pid so the
+    driver can confirm every worker has been primed. The brief hold makes a worker keep this
+    task long enough for its siblings to each claim one, so the driver's pid-coverage loop
+    completes in a single round rather than depending on scheduling luck."""
+    if token not in _shared_objects:
+        _shared_objects[token] = pickle.loads(payload)
+    time.sleep(0.002)
+    return os.getpid()
+
+
+def _proc_task_shared(token: str, partition: Partition) -> object:
+    assert _proc_resources is not None  # set by the pool initializer
+    process = cast("Callable[[Partition, LocalResources], object]", _shared_objects[token])
     return process(partition, _proc_resources)
 
 
@@ -92,20 +118,27 @@ class _BaseExecutor:
         # over many plans — notebooks, sweeps); the default stays a fresh pool per run.
         self._persistent = persistent
         self._kept_pool: _PoolExecutor | None = None
+        self._broadcast_tokens: set[str] = set()  # M31: which processes this pool already has
 
     def _pool(self) -> _PoolExecutor:
         raise NotImplementedError
 
-    def _entry(self) -> Callable[..., object]:
+    def _prepare(
+        self, pool: _PoolExecutor, process: Callable[[Partition, LocalResources], object]
+    ) -> Callable[[Partition], Future[object]]:
+        """Deliver ``process`` to the pool's workers as needed and return ``submit(partition)``.
+        Threads share memory (no delivery); processes broadcast the process once (M31)."""
         raise NotImplementedError
 
     @contextlib.contextmanager
     def _acquired_pool(self) -> Iterator[_PoolExecutor]:
         if not self._persistent:
+            self._broadcast_tokens = set()  # a fresh pool: nothing is primed yet
             with self._pool() as pool:
                 yield pool
             return
         if self._kept_pool is None:
+            self._broadcast_tokens = set()  # newly (re)spawned workers hold no cache
             self._kept_pool = self._pool()
         yield self._kept_pool  # kept alive for the next run()
 
@@ -114,6 +147,7 @@ class _BaseExecutor:
         if self._kept_pool is not None:
             self._kept_pool.shutdown(wait=True)
             self._kept_pool = None
+            self._broadcast_tokens = set()  # respawned workers will need re-priming
 
     def __enter__(self) -> _BaseExecutor:
         return self
@@ -143,9 +177,8 @@ class _BaseExecutor:
             waiting.setdefault(b, []).append(ci)
 
         with self._acquired_pool() as pool:
-            node_of: dict[Future[object], int] = {
-                pool.submit(self._entry(), plan.process, t.partition): i for i, t in enumerate(tasks)
-            }
+            submit = self._prepare(pool, plan.process)
+            node_of: dict[Future[object], int] = {submit(t.partition): i for i, t in enumerate(tasks)}
             ready: dict[int, R] = {}
             n_combines = 0
             leaves_done = 0
@@ -175,9 +208,8 @@ class _BaseExecutor:
         if n == 0:
             return ExecResult(plan.empty(), 0, 0, StopReason.EXHAUSTED)
         with self._acquired_pool() as pool:
-            leaf_of: dict[Future[object], int] = {
-                pool.submit(self._entry(), plan.process, t.partition): i for i, t in enumerate(tasks)
-            }
+            submit = self._prepare(pool, plan.process)
+            leaf_of: dict[Future[object], int] = {submit(t.partition): i for i, t in enumerate(tasks)}
 
             def completed() -> Iterator[tuple[int, R]]:
                 for fut in as_completed(leaf_of):
@@ -198,13 +230,14 @@ class _BaseExecutor:
         next_tasks = plan.next_tasks
 
         with self._acquired_pool() as pool:
+            submit = self._prepare(pool, plan.process)
 
             def refill() -> None:
                 batch = next_tasks(ctx)  # DONE == None
                 if not batch:
                     return
                 for task in batch:
-                    fut = pool.submit(self._entry(), plan.process, task.partition)
+                    fut = submit(task.partition)
                     submitted[fut] = (task.key, task.partition.n_entries, time.perf_counter())
 
             refill()
@@ -235,8 +268,10 @@ class ThreadExecutor(_BaseExecutor):
     def _pool(self) -> _PoolExecutor:
         return ThreadPoolExecutor(max_workers=self.max_workers)
 
-    def _entry(self) -> Callable[..., object]:
-        return _thread_task
+    def _prepare(
+        self, pool: _PoolExecutor, process: Callable[[Partition, LocalResources], object]
+    ) -> Callable[[Partition], Future[object]]:
+        return lambda partition: pool.submit(_thread_task, process, partition)
 
 
 class ProcessExecutor(_BaseExecutor):
@@ -251,5 +286,25 @@ class ProcessExecutor(_BaseExecutor):
             initializer=_proc_init,
         )
 
-    def _entry(self) -> Callable[..., object]:
-        return _proc_task
+    def _prepare(
+        self, pool: _PoolExecutor, process: Callable[[Partition, LocalResources], object]
+    ) -> Callable[[Partition], Future[object]]:
+        payload = pickle.dumps(process)  # pickled ONCE; the bytes are reused for the broadcast
+        token = hashlib.sha256(payload).hexdigest()
+        self._broadcast(pool, token, payload)
+        return lambda partition: pool.submit(_proc_task_shared, token, partition)
+
+    def _broadcast(self, pool: _PoolExecutor, token: str, payload: bytes) -> None:
+        """Prime every worker with ``payload`` exactly once. concurrent.futures exposes no worker
+        identity, so we submit priming tasks (each holds briefly, then returns its pid) until the
+        set of pids covers the whole pool — the prime is idempotent, so extra hits are harmless."""
+        if token in self._broadcast_tokens:
+            return
+        target = int(getattr(pool, "_max_workers", self.max_workers or 1))
+        seen: set[int] = set()
+        rounds = 0
+        while len(seen) < target and rounds < 1000:
+            batch = [pool.submit(_prime_shared, token, payload) for _ in range(target - len(seen))]
+            seen.update(f.result() for f in batch)
+            rounds += 1
+        self._broadcast_tokens.add(token)
