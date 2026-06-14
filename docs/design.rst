@@ -120,6 +120,33 @@ throughput stabilizes) without changing the executor; the fixed tree remains the
 known partition sets, where determinism matters most.
 
 
+Live observability: the monitor seam (M37)
+------------------------------------------
+
+Every executor accepts an optional ``monitor=`` — a passive ``graphed_core.execution.Monitor`` that
+*watches* a run. It is the seam a live dashboard plugs into (see ``graphed-debug``'s ``Dashboard``),
+but the executor knows nothing about rendering or transport: it only emits a small, picklable
+``TaskEvent`` vocabulary.
+
+The lifecycle of one task is three events: the driver emits ``SUBMITTED`` when it hands the task to
+the pool; the worker emits ``STARTED`` before running it and exactly one of ``FINISHED`` / ``ERRORED``
+after. Where those worker events go differs by pool, and this is the interesting part:
+
+* **Thread pool** — workers share the driver's address space, so they call the monitor directly.
+* **Process pool** — workers cannot reach the driver's monitor object, so they push events onto a
+  bounded ``multiprocessing.Manager().Queue()``; a **driver-side collector daemon thread** drains it
+  and replays them into the monitor. (The driver still emits ``SUBMITTED`` locally.) A per-worker
+  statistical profiler, if one is supplied via the monitor's ``worker_profiler_factory``, rides the
+  same queue.
+
+The non-negotiable property is **passivity**: emission is best-effort and *drop-on-full*. If the
+monitor is slow or its queue is full, events are dropped — never buffered into back-pressure that
+would change task timing (and thus the adaptive ``next_tasks`` path) or stall a worker. A monitor that
+raises is swallowed. The upshot, pinned by the suite: a run's ``ExecResult.value`` and combine count
+are byte-identical whether or not a monitor (even a profiling one) is attached. Observability here is
+strictly a side channel, never part of the computation.
+
+
 Phase 2 (deliberately not built)
 --------------------------------
 
