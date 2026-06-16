@@ -20,7 +20,7 @@ import pickle
 import queue
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import (
     FIRST_COMPLETED,
@@ -61,6 +61,19 @@ _proc_resources: LocalResources | None = None
 _proc_event_q: object | None = None
 _proc_profiler: WorkerProfiler | None = None
 _MISSING = object()
+
+# M37 (telemetry OFF the data path): a worker emits events into a local in-process buffer (a deque
+# append, ~0.1us) instead of doing a Manager().Queue() put per task (~21us IPC round-trip, ~35x
+# slower). A per-worker daemon thread drains the buffer on a cadence and ships the whole batch with
+# ONE Manager put, so IPC latency + batching never touch the task's critical path. The buffer is
+# bounded (drops oldest if the drain can't keep up — best-effort, never blocks the worker).
+_proc_buffer: deque[tuple[str, object]] | None = None
+_proc_drain_stop: threading.Event | None = None
+_proc_drain_thread: threading.Thread | None = None
+_proc_last_flush = 0.0
+_PROC_DRAIN_INTERVAL = 0.05  # seconds between worker->driver batch flushes
+_PROC_BUFFER_CAP = 50000  # bounded local buffer (drop-oldest on overflow)
+_PROFILE_FLUSH_INTERVAL = 1.0  # serialize the profiler at most ~1/s, never per task
 
 # M37: every statistical profiler we start (thread-local or per-process) is registered here so a
 # single atexit handler can stop it. pyinstrument's sampler timer otherwise outlives the worker and
@@ -111,7 +124,8 @@ def _proc_init(
     profiler_factory: Callable[[], WorkerProfiler] | None = None,
     event_q: object | None = None,
 ) -> None:
-    global _proc_resources, _proc_event_q, _proc_profiler
+    global _proc_resources, _proc_event_q, _proc_profiler, _proc_buffer
+    global _proc_drain_stop, _proc_drain_thread
     _proc_resources = LocalResources()
     _proc_event_q = event_q
     if profiler_factory is not None:
@@ -120,15 +134,70 @@ def _proc_init(
             prof.start()
             _proc_profiler = prof
             _register_profiler(prof)  # stopped at worker-process exit (silences sampler teardown)
+    if event_q is not None:  # a monitor is attached -> run the off-path drain thread for this worker
+        _proc_buffer = deque(maxlen=_PROC_BUFFER_CAP)
+        _proc_drain_stop = threading.Event()
+        _proc_drain_thread = threading.Thread(
+            target=_proc_drain_loop, name="graphed-dash-worker-drain", daemon=True
+        )
+        _proc_drain_thread.start()
+        atexit.register(_proc_drain_final)
 
 
 def _proc_emit(item: tuple[str, object]) -> None:
-    """Best-effort worker->driver put: a full queue drops the event (never blocks the worker)."""
-    q = _proc_event_q
-    if q is None:
+    """Append an event to this worker's local buffer (in-process, ~0.1us). The drain thread ships it;
+    the data path never blocks on IPC. The bounded deque drops the oldest on overflow (best-effort)."""
+    buf = _proc_buffer
+    if buf is not None:
+        buf.append(item)
+
+
+def _proc_drain_batch() -> None:
+    """Move everything currently buffered to the driver in ONE Manager-queue put (amortizes IPC)."""
+    buf, q = _proc_buffer, _proc_event_q
+    if buf is None or q is None:
         return
-    with contextlib.suppress(Exception):
-        q.put_nowait(item)  # type: ignore[attr-defined]
+    batch: list[tuple[str, object]] = []
+    while True:
+        try:
+            batch.append(buf.popleft())
+        except IndexError:
+            break
+    if batch:
+        with contextlib.suppress(Exception):  # a full driver queue drops the batch; never blocks
+            q.put_nowait(("batch", batch))  # type: ignore[attr-defined]
+
+
+def _proc_drain_loop() -> None:
+    stop = _proc_drain_stop
+    assert stop is not None
+    while not stop.is_set():
+        stop.wait(_PROC_DRAIN_INTERVAL)
+        _proc_drain_batch()
+
+
+def _proc_drain_final() -> None:
+    """At worker exit: stop sampling (same thread that started it), buffer the final session, and
+    flush whatever remains so the last events/profile are not lost."""
+    if _proc_drain_stop is not None:
+        _proc_drain_stop.set()
+    if _proc_profiler is not None:
+        with contextlib.suppress(Exception):
+            payload = _proc_profiler.stop()
+            if payload and _proc_buffer is not None:
+                _proc_buffer.append(("profile", (str(os.getpid()), payload)))
+    _proc_drain_batch()
+
+
+def _proc_profile_due() -> bool:
+    """True at most once per ``_PROFILE_FLUSH_INTERVAL`` — keeps the (expensive) profiler serialize
+    off the per-task path. Called on the worker thread, where pyinstrument is valid."""
+    global _proc_last_flush
+    now = time.monotonic()
+    if now - _proc_last_flush >= _PROFILE_FLUSH_INTERVAL:
+        _proc_last_flush = now
+        return True
+    return False
 
 
 def _run_with_emit(
@@ -140,9 +209,12 @@ def _run_with_emit(
     emit_event: Callable[[TaskEvent], None],
     emit_profile: Callable[[str, bytes], None],
     profiler: WorkerProfiler | None,
+    profile_due: Callable[[], bool],
 ) -> object:
-    """Run one task, emitting STARTED before and FINISHED/ERRORED after (worker-side timing), then
-    flushing the profiler. SUBMITTED is emitted driver-side. Emission is best-effort."""
+    """Run one task, emitting STARTED before and FINISHED/ERRORED after (worker-side timing).
+    ``emit_event`` is cheap (a local buffer append for processes, an in-process enqueue for threads);
+    the (expensive) profiler serialize runs only when ``profile_due()`` says so (time-throttled, off
+    the per-task path). SUBMITTED is emitted driver-side. Emission is best-effort."""
     label = partition_label(task.partition)
     n = task.partition.n_entries
     emit_event(TaskEvent(TaskPhase.STARTED, task.key, worker, time.perf_counter(), label, n))
@@ -156,7 +228,7 @@ def _run_with_emit(
         )
         raise
     emit_event(TaskEvent(TaskPhase.FINISHED, task.key, worker, time.perf_counter(), label, n))
-    if profiler is not None:
+    if profiler is not None and profile_due():
         with contextlib.suppress(Exception):
             payload = profiler.flush()
             if payload:
@@ -192,11 +264,21 @@ def _thread_profiler(monitor: Monitor | None) -> WorkerProfiler | None:
     return prof
 
 
+def _thread_profile_due() -> bool:
+    """Per-thread time throttle for the profiler serialize (see :func:`_proc_profile_due`)."""
+    now = time.monotonic()
+    last = cast("float", getattr(_thread_local, "last_flush", 0.0))
+    if now - last >= _PROFILE_FLUSH_INTERVAL:
+        _thread_local.last_flush = now
+        return True
+    return False
+
+
 def _thread_task(
     process: Callable[[Partition, LocalResources], object], task: Task, monitor: Monitor | None
 ) -> object:
     def emit_event(ev: TaskEvent) -> None:
-        emit_task(monitor, ev)
+        emit_task(monitor, ev)  # in-process enqueue; the NetworkMonitor's sender thread does the I/O
 
     def emit_profile(worker: str, payload: bytes) -> None:
         if monitor is not None:
@@ -211,6 +293,7 @@ def _thread_task(
         emit_event=emit_event,
         emit_profile=emit_profile,
         profiler=_thread_profiler(monitor),
+        profile_due=_thread_profile_due,
     )
 
 
@@ -233,7 +316,7 @@ def _proc_task_shared(token: str, task: Task) -> object:
     process = cast("Callable[[Partition, LocalResources], object]", _shared_objects[token])
 
     def emit_event(ev: TaskEvent) -> None:
-        _proc_emit(("task", ev))
+        _proc_emit(("task", ev))  # local buffer append; the drain thread ships it off-path
 
     def emit_profile(worker: str, payload: bytes) -> None:
         _proc_emit(("profile", (worker, payload)))
@@ -246,6 +329,7 @@ def _proc_task_shared(token: str, task: Task) -> object:
         emit_event=emit_event,
         emit_profile=emit_profile,
         profiler=_proc_profiler,
+        profile_due=_proc_profile_due,
     )
 
 
@@ -528,7 +612,12 @@ class ProcessExecutor(_BaseExecutor):
             with super()._acquired_pool() as pool:
                 yield pool
         finally:
-            self._stop_collector()  # pool work is done -> drain remaining worker events, then join
+            # The collector's lifecycle follows the POOL, not the run. Non-persistent: the pool is
+            # shut down above, so drain + stop now. Persistent: workers stay alive and keep draining
+            # their buffers *after* run() returns (emission is off-path/async), so the collector must
+            # stay alive across runs or those trailing events are lost — close() stops it.
+            if not self._persistent:
+                self._stop_collector()
 
     def _ensure_collector(self) -> None:
         if self.monitor is None:
@@ -536,11 +625,12 @@ class ProcessExecutor(_BaseExecutor):
         if self._mgr is None:  # one manager + queue for this executor's lifetime
             self._mgr = multiprocessing.get_context("spawn").Manager()
             self._event_q = self._mgr.Queue(maxsize=10000)
-        self._collector_stop = threading.Event()
-        self._collector = threading.Thread(
-            target=self._collect_loop, name="graphed-dash-collector", daemon=True
-        )
-        self._collector.start()
+        if self._collector is None or not self._collector.is_alive():  # idempotent across runs
+            self._collector_stop = threading.Event()
+            self._collector = threading.Thread(
+                target=self._collect_loop, name="graphed-dash-collector", daemon=True
+            )
+            self._collector.start()
 
     def _collect_loop(self) -> None:
         q = self._event_q
@@ -564,6 +654,10 @@ class ProcessExecutor(_BaseExecutor):
         if monitor is None:
             return
         kind, payload = item
+        if kind == "batch":  # a worker drain thread coalesces many events into one Manager put
+            for sub in cast("list[tuple[str, object]]", payload):
+                self._dispatch(sub)
+            return
         with contextlib.suppress(Exception):
             if kind == "task":
                 monitor.on_task(cast("TaskEvent", payload))

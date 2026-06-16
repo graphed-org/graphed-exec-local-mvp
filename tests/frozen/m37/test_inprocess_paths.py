@@ -1,8 +1,9 @@
-"""M37 frozen suite (graphed-exec-local slice): exercise the worker/profiler code paths IN THE MAIN
+"""M37 frozen suite (graphed-exec-local slice): exercise the worker telemetry paths IN THE MAIN
 PROCESS. In normal use these run inside spawned worker processes (where coverage.py cannot observe
-them) or only when a profiler is attached; here we drive the same module functions directly and via
-a ThreadExecutor, deterministically and on every platform (no subprocess-coverage machinery, no
-dashboard dependency)."""
+them); here we drive the same module functions directly and via a ThreadExecutor, deterministically.
+
+These also pin the **off-the-data-path** design: a worker emit is a local buffer append (no IPC), a
+drain thread batches the buffer to the driver, and the profiler serialize is time-throttled."""
 
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from graphed_exec_local.executors import ThreadExecutor
 
 
 class FakeProfiler:
-    """A deterministic WorkerProfiler stand-in (no pyinstrument): flush always yields bytes."""
+    """A deterministic WorkerProfiler stand-in (no pyinstrument): flush/stop always yield bytes."""
 
     def __init__(self) -> None:
         self.started = False
@@ -63,12 +64,29 @@ class ProfMonitor:
 
 
 def _reset_globals() -> None:
+    if ex._proc_drain_stop is not None:
+        ex._proc_drain_stop.set()
+    if ex._proc_drain_thread is not None:
+        ex._proc_drain_thread.join(timeout=2)
     ex._proc_resources = None
     ex._proc_event_q = None
     ex._proc_profiler = None
+    ex._proc_buffer = None
+    ex._proc_drain_stop = None
+    ex._proc_drain_thread = None
+    ex._proc_last_flush = 0.0
     ex._shared_objects.clear()
     with ex._profiler_lock:
         ex._live_profilers.clear()
+
+
+def _drain_q(q: queue.Queue) -> list:
+    items = []
+    while True:
+        try:
+            items.append(q.get_nowait())
+        except queue.Empty:
+            return items
 
 
 def test_thread_profiling_runs_profiler_in_process() -> None:
@@ -78,7 +96,7 @@ def test_thread_profiling_runs_profiler_in_process() -> None:
     with ThreadExecutor(max_workers=2, monitor=mon) as e:
         result = e.run(plan)
     assert result.value == sum((k + 1) * 3 for k in range(4))
-    assert mon.profiles  # the fake profiler flushed -> on_profile fired (emit_profile path)
+    assert mon.profiles  # the fake profiler flushed (first task is profile-due) -> on_profile fired
     assert sum(1 for ev in mon.events if ev.phase is TaskPhase.FINISHED) == 4  # type: ignore[attr-defined]
 
 
@@ -96,39 +114,65 @@ def test_render_error_branches() -> None:
     assert ex._render_error(ValueError("z")) == "ValueError: z"  # generic fallback
 
 
-def test_proc_emit_paths() -> None:
+def test_emit_appends_to_local_buffer_not_ipc() -> None:
+    """The data path append is in-process: it touches the buffer, never the Manager queue."""
     try:
-        q: queue.Queue = queue.Queue(maxsize=2)
-        ex._proc_event_q = q
+        ex._proc_event_q = "a-sentinel-not-a-queue"  # would explode if _proc_emit did IPC
+        ex._proc_buffer = ex.deque(maxlen=3)
         ex._proc_emit(("task", "A"))
-        assert q.get_nowait() == ("task", "A")
-        ex._proc_emit(("x", 1))
-        ex._proc_emit(("y", 2))
-        ex._proc_emit(("z", 3))  # queue full -> dropped, never raises
-        ex._proc_event_q = None
-        ex._proc_emit(("ignored", 1))  # None queue -> no-op
+        ex._proc_emit(("task", "B"))
+        assert list(ex._proc_buffer) == [("task", "A"), ("task", "B")]
+        # bounded: a 4th over maxlen=3 drops the oldest, never raises/blocks
+        ex._proc_emit(("task", "C"))
+        ex._proc_emit(("task", "D"))
+        assert list(ex._proc_buffer) == [("task", "B"), ("task", "C"), ("task", "D")]
+        ex._proc_buffer = None
+        ex._proc_emit(("task", "ignored"))  # no buffer -> no-op
     finally:
         _reset_globals()
 
 
-def test_proc_init_and_worker_entry_in_process() -> None:
+def test_drain_batch_ships_one_batched_put() -> None:
     try:
         q: queue.Queue = queue.Queue(maxsize=50)
-        ex._proc_init(fake_factory, q)  # the process-pool initializer, with a profiler
+        ex._proc_event_q = q
+        ex._proc_buffer = ex.deque(maxlen=100)
+        ex._proc_emit(("task", 1))
+        ex._proc_emit(("profile", ("w", b"p")))
+        ex._proc_drain_batch()
+        items = _drain_q(q)
+        assert len(items) == 1 and items[0][0] == "batch"  # the whole buffer in ONE put
+        assert items[0][1] == [("task", 1), ("profile", ("w", b"p"))]
+        assert len(ex._proc_buffer) == 0  # buffer drained
+        ex._proc_drain_batch()  # nothing buffered -> no put
+        assert _drain_q(q) == []
+    finally:
+        _reset_globals()
+
+
+def test_profile_due_is_time_throttled() -> None:
+    try:
+        ex._proc_last_flush = 0.0
+        assert ex._proc_profile_due() is True  # first call after reset is due
+        assert ex._proc_profile_due() is False  # immediate second call is throttled
+    finally:
+        _reset_globals()
+
+
+def test_proc_init_worker_entry_and_drain_thread() -> None:
+    try:
+        q: queue.Queue = queue.Queue(maxsize=100)
+        ex._proc_init(fake_factory, q)  # starts the per-worker buffer + drain thread + profiler
         assert ex._proc_resources is not None
         assert ex._proc_profiler is not None
+        assert ex._proc_drain_thread is not None and ex._proc_drain_thread.is_alive()
         token = "tok"
-        ex._prime_shared(token, pickle.dumps(count_entries))  # the broadcast prime (worker side)
-        assert token in ex._shared_objects
+        ex._prime_shared(token, pickle.dumps(count_entries))
         out = ex._proc_task_shared(token, Task(0, Partition("f.root", "Events", 0, 9)))  # worker entry
         assert out == 9
-        kinds = []
-        while True:
-            try:
-                kinds.append(q.get_nowait()[0])
-            except queue.Empty:
-                break
-        assert "task" in kinds and "profile" in kinds  # STARTED/FINISHED + a profiler flush
+        ex._proc_drain_final()  # stop the loop, flush final session + remaining buffer
+        kinds = [k for item in _drain_q(q) for (k, _payload) in (item[1] if item[0] == "batch" else [item])]
+        assert "task" in kinds and "profile" in kinds  # STARTED/FINISHED + a (throttled) profile flush
     finally:
         _reset_globals()
 
