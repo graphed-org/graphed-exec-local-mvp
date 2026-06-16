@@ -34,7 +34,7 @@ from concurrent.futures import (
     Executor as _PoolExecutor,
 )
 from multiprocessing.managers import SyncManager
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from graphed_core import ExecContext, ExecResult, Partition, Plan, StopReason, Task
 from graphed_core.execution import (
@@ -48,9 +48,19 @@ from graphed_core.execution import (
 )
 from graphed_debug import StageError
 
+from ._peer import (
+    http_driver_handshake,
+    http_peer_actor,
+    ipc_peer_actor,
+    make_bounds,
+    process_and_reduce,
+    slice_items,
+)
 from ._reduce import plan_tree, running_fold, tree_reduce
+from ._transport import HttpTransport, QueueTransport, build_transports
 
 R = TypeVar("R")
+_PEER_PENDING: Any = object()  # sentinel: the peer root has not arrived yet
 
 # ---- per-worker resources --------------------------------------------------
 _thread_local = threading.local()
@@ -355,6 +365,8 @@ class _BaseExecutor:
         pooled_combines: bool = False,
         persistent: bool = False,
         monitor: Monitor | None = None,
+        comms: str | None = "ipc",
+        steal: bool = True,
     ):
         self.max_workers = max_workers if max_workers is not None else (os.cpu_count() or 1)
         self._on_combine = on_combine  # test hook: called per tree-reduce combine with #leaves so far
@@ -367,6 +379,24 @@ class _BaseExecutor:
             OrderedDict()
         )  # M31/M34: primed tokens, FIFO-bounded in lockstep with each worker cache
         self.monitor = monitor  # M37: a passive dashboard observer (None => no instrumentation)
+        # M38: comms=None -> the hub reduction (driver combines); "ipc"/"http" -> PEER reduction
+        # (combines run across the workers over that transport, off the driver). Result is identical
+        # (same fixed plan_tree grouping); peer just relocates the combines. steal=True (peer only)
+        # lets an idle worker take leaves from a busy peer (process work moves; the leaf's owner still
+        # reduces it -> result unchanged). The last run's per-worker witness stats are kept for tests.
+        self._comms = comms
+        self._steal = steal
+        self._last_peer_witness: list[dict[str, int]] = []
+        # STRICT: peer reduction (comms set) emits monitor events + fires on_combine, but it CANNOT run
+        # pooled combines (its whole model is off-driver combines — `pooled_combines` is a hub-only
+        # mechanism). Rather than SILENTLY falling back to the hub path (hub-mode sneaking into a run
+        # the caller asked to be peer), refuse loudly, so a big calculation can never quietly run hub
+        # when peer was requested. (comms=None => hub, which supports pooled_combines.)
+        if comms is not None and pooled_combines:
+            raise ValueError(
+                f"peer reduction (comms={comms!r}) does not support pooled_combines (a hub-only "
+                f"mechanism); use comms=None for the hub path, or drop pooled_combines"
+            )
 
     def _pool(self) -> _PoolExecutor:
         raise NotImplementedError
@@ -440,9 +470,75 @@ class _BaseExecutor:
     def run(self, plan: Plan[R]) -> ExecResult[R]:
         if plan.next_tasks is not None:
             return self._run_adaptive(plan)
+        if self._comms is not None:
+            return self._run_peer(plan)
         if self._pooled_combines:
             return self._run_fixed_pooled(plan)
         return self._run_fixed(plan)
+
+    def _run_peer(self, plan: Plan[R]) -> ExecResult[R]:
+        """M38 peer reduction: partition the leaves into contiguous per-worker ranges and reduce them
+        across the workers over ``self._comms``, off the driver. The subclass spawns the W actors
+        (threads or processes); the result is bit-for-bit the hub path's (same fixed tree).
+
+        Monitor parity (so peer can be the default): the driver emits SUBMITTED per task here, the
+        workers emit STARTED/FINISHED/ERRORED over the transport (forwarded to the monitor by the
+        collect loop), and the driver fires the n-1 combine callbacks below."""
+        tasks = sorted(plan.tasks, key=lambda t: t.key)  # deterministic leaf order
+        n = len(tasks)
+        if n == 0:
+            return ExecResult(plan.empty(), 0, 0, StopReason.EXHAUSTED)
+        w = max(1, min(self.max_workers, n))
+        bounds = make_bounds(n, w)
+        worker_addrs = tuple(f"w{i}" for i in range(w))
+        items = slice_items([t.partition for t in tasks], bounds, worker_addrs)
+        if self.monitor is not None:  # driver-side SUBMITTED (worker-side STARTED/FINISHED/ERRORED stream in)
+            for t in tasks:
+                emit_task(
+                    self.monitor,
+                    TaskEvent(
+                        TaskPhase.SUBMITTED,
+                        t.key,
+                        "driver",
+                        time.perf_counter(),
+                        partition_label(t.partition),
+                        t.partition.n_entries,
+                    ),
+                )
+        value = self._peer_execute(plan, n, w, bounds, worker_addrs, items)
+        for _ in range(n - 1):  # peer ran n-1 combines across the workers; report the count (M37/legacy)
+            self._combine_cb(n)
+        return ExecResult(value, n, n - 1, StopReason.EXHAUSTED)
+
+    def _peer_profiler_factory(self) -> Callable[[], WorkerProfiler] | None:
+        """The picklable per-worker profiler factory (M37), or None — so peer workers profile exactly
+        like the hub path and ``Dashboard(profile=True)`` works under peer (no silent loss)."""
+        return self.monitor.worker_profiler_factory() if self.monitor is not None else None
+
+    def _forward_peer_events(self, payload: tuple[Any, ...]) -> bool:
+        """If ``payload`` is a worker monitor-event batch (task lifecycle) or a profile sample-tree,
+        forward it to the monitor and return True; else return False (the caller handles root/other
+        messages). Best-effort (M37 passivity) — a raising monitor never breaks the run."""
+        if payload[0] == "events":
+            for ev in payload[1]:
+                emit_task(self.monitor, ev)
+            return True
+        if payload[0] == "profile" and self.monitor is not None:
+            with contextlib.suppress(Exception):
+                self.monitor.on_profile(payload[1], payload[2])
+            return True
+        return False
+
+    def _peer_execute(
+        self,
+        plan: Plan[R],
+        n: int,
+        w: int,
+        bounds: list[int],
+        worker_addrs: tuple[str, ...],
+        items: dict[str, list[tuple[int, Partition]]],
+    ) -> R:
+        raise NotImplementedError
 
     def _run_fixed_pooled(self, plan: Plan[R]) -> ExecResult[R]:
         tasks = sorted(plan.tasks, key=lambda t: t.key)  # deterministic leaf order
@@ -554,6 +650,79 @@ class ThreadExecutor(_BaseExecutor):
     ) -> Callable[[Task], Future[object]]:
         return lambda task: pool.submit(_thread_task, process, task, self.monitor)
 
+    def _peer_execute(
+        self,
+        plan: Plan[R],
+        n: int,
+        w: int,
+        bounds: list[int],
+        worker_addrs: tuple[str, ...],
+        items: dict[str, list[tuple[int, Partition]]],
+    ) -> R:
+        # threads share the process, so the in-process transports (queue.Queue or loopback HTTP) are
+        # built once by the driver and handed to each worker thread directly.
+        transports = build_transports(self._comms or "ipc", ("driver", *worker_addrs))
+        witness: dict[str, dict[str, int]] = {}
+        errors: dict[str, BaseException] = {}  # a worker thread's exception (captured, then re-raised)
+
+        def actor(addr: str) -> None:
+            try:
+                witness[addr] = process_and_reduce(
+                    addr,
+                    transports[addr],
+                    n,
+                    bounds,
+                    worker_addrs,
+                    plan.process,
+                    plan.combine,
+                    items[addr],
+                    LocalResources(),  # fresh per worker thread (closed when the actor returns)
+                    steal=self._steal,
+                    emit=self.monitor is not None,
+                    profiler_factory=self._peer_profiler_factory(),
+                )
+            except BaseException as exc:  # a thread exception is otherwise lost -> capture + propagate
+                errors[addr] = exc
+
+        threads = [
+            threading.Thread(target=actor, args=(a,), name=f"graphed-peer-{a}", daemon=True)
+            for a in worker_addrs
+        ]
+        for t in threads:
+            t.start()
+        try:
+            driver_t = transports["driver"]
+            if n == 0:
+                driver_t.broadcast(("done",))
+                return plan.empty()
+            deadline = time.monotonic() + 300.0
+            root: Any = _PEER_PENDING
+            while root is _PEER_PENDING:
+                got = driver_t.recv(timeout=0.05)
+                if got is not None and got[1][0] == "root":
+                    root = got[1][1]
+                    break
+                if got is not None:
+                    self._forward_peer_events(got[1])  # worker events -> monitor
+                if errors:  # a worker failed -> the root will never form; stop waiting and re-raise
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("peer reduction did not produce a root within 300s")
+            driver_t.broadcast(("done",))
+            for t in threads:
+                t.join(timeout=30.0)
+            for _sender, payload in driver_t.poll():  # drain trailing monitor events the workers shipped
+                self._forward_peer_events(payload)
+            if errors:
+                raise next(iter(errors.values()))  # re-raise a worker exception intact (M6)
+            return cast(R, root)
+        finally:
+            for t in threads:
+                t.join(timeout=30.0)
+            for tr in transports.values():
+                tr.close()
+            self._last_peer_witness = [witness[a] for a in worker_addrs if a in witness]
+
 
 class ProcessExecutor(_BaseExecutor):
     """Process-pool executor: spawn-based worker processes (cross-platform + free-threaded-safe), each
@@ -573,6 +742,8 @@ class ProcessExecutor(_BaseExecutor):
         pooled_combines: bool = False,
         persistent: bool = False,
         monitor: Monitor | None = None,
+        comms: str | None = "ipc",
+        steal: bool = True,
     ):
         super().__init__(
             max_workers,
@@ -580,11 +751,198 @@ class ProcessExecutor(_BaseExecutor):
             pooled_combines=pooled_combines,
             persistent=persistent,
             monitor=monitor,
+            comms=comms,
+            steal=steal,
         )
         self._mgr: SyncManager | None = None
         self._event_q: object | None = None
         self._collector: threading.Thread | None = None
         self._collector_stop: threading.Event | None = None
+        # M38 persistent peer state: reused across run()s when persistent=True so the worker spawn AND
+        # (for IPC) the Manager spawn are paid once, exactly like the hub pool — the fair-benchmark path.
+        self._peer_pool: ProcessPoolExecutor | None = None
+        self._peer_nworkers = 0
+        self._peer_mgr: SyncManager | None = None
+        self._peer_inboxes: dict[str, Any] | None = None
+        self._peer_driver: QueueTransport | None = None
+
+    def _close_peer(self) -> None:
+        if self._peer_pool is not None:
+            self._peer_pool.shutdown(wait=True)
+            self._peer_pool = None
+        if self._peer_mgr is not None:
+            self._peer_mgr.shutdown()
+            self._peer_mgr = None
+        self._peer_inboxes = None
+        self._peer_driver = None
+        self._peer_nworkers = 0
+
+    # ---- M38 peer reduction across worker PROCESSES (cross-process transport) ----
+
+    def _peer_execute(
+        self,
+        plan: Plan[R],
+        n: int,
+        w: int,
+        bounds: list[int],
+        worker_addrs: tuple[str, ...],
+        items: dict[str, list[tuple[int, Partition]]],
+    ) -> R:
+        ctx = multiprocessing.get_context("spawn")
+        if (self._comms or "ipc") == "http":
+            return self._peer_http(plan, n, w, bounds, worker_addrs, items, ctx)
+        return self._peer_ipc(plan, n, w, bounds, worker_addrs, items, ctx)
+
+    def _peer_ipc(
+        self,
+        plan: Plan[R],
+        n: int,
+        w: int,
+        bounds: list[int],
+        worker_addrs: tuple[str, ...],
+        items: dict[str, list[tuple[int, Partition]]],
+        ctx: Any,
+    ) -> R:
+        # IPC across processes: Manager().Queue() inboxes are picklable proxies, so each worker's
+        # inbox + its peer outboxes are handed in as submit args; the worker builds its QueueTransport.
+        # persistent=True reuses the pool + Manager + inboxes across run()s (spawn paid once, like hub).
+        addrs = ("driver", *worker_addrs)
+        reuse = (
+            self._persistent
+            and self._peer_pool is not None
+            and self._peer_nworkers == w
+            and self._peer_inboxes is not None
+            and self._peer_driver is not None
+        )
+        if reuse:
+            pool, inboxes, driver_t = self._peer_pool, self._peer_inboxes, self._peer_driver
+            assert driver_t is not None
+            for _ in driver_t.poll():  # clear any straggler before reuse (a clean run leaves none)
+                pass
+        else:
+            self._close_peer()
+            mgr = ctx.Manager()
+            inboxes = {a: mgr.Queue(maxsize=10000) for a in addrs}
+            driver_t = QueueTransport(
+                "driver", inboxes["driver"], {a: inboxes[a] for a in addrs if a != "driver"}
+            )
+            pool = ProcessPoolExecutor(max_workers=w, mp_context=ctx)
+            if self._persistent:
+                self._peer_pool, self._peer_mgr, self._peer_inboxes = pool, mgr, inboxes
+                self._peer_driver, self._peer_nworkers = driver_t, w
+        assert pool is not None and inboxes is not None and driver_t is not None
+        factory = self._peer_profiler_factory()
+        try:
+            futs = [
+                pool.submit(
+                    ipc_peer_actor,
+                    a,
+                    inboxes[a],
+                    {p: inboxes[p] for p in addrs if p != a},
+                    n,
+                    bounds,
+                    worker_addrs,
+                    plan.process,
+                    plan.combine,
+                    items[a],
+                    self._steal,
+                    self.monitor is not None,
+                    factory,
+                )
+                for a in worker_addrs
+            ]
+            return self._collect_peer(driver_t, plan, n, futs)
+        finally:
+            if not self._persistent:
+                pool.shutdown()
+                mgr.shutdown()
+
+    def _peer_http(
+        self,
+        plan: Plan[R],
+        n: int,
+        w: int,
+        bounds: list[int],
+        worker_addrs: tuple[str, ...],
+        items: dict[str, list[tuple[int, Partition]]],
+        ctx: Any,
+    ) -> R:
+        # HTTP across processes: each worker binds its own loopback server and announces its port to
+        # the driver (known up front), which assembles + broadcasts the registry — real sockets, the
+        # path a distributed scheduler takes. persistent=True reuses the worker POOL (spawn paid once);
+        # the loopback servers + discovery handshake are re-done per run (workers are per-submit actors).
+        reuse = self._persistent and self._peer_pool is not None and self._peer_nworkers == w
+        if reuse:
+            pool = self._peer_pool
+        else:
+            self._close_peer()
+            pool = ProcessPoolExecutor(max_workers=w, mp_context=ctx)
+            if self._persistent:
+                self._peer_pool, self._peer_nworkers = pool, w
+        assert pool is not None
+        driver_t = HttpTransport("driver")
+        factory = self._peer_profiler_factory()
+        try:
+            futs = [
+                pool.submit(
+                    http_peer_actor,
+                    a,
+                    driver_t.host,
+                    driver_t.port,
+                    n,
+                    bounds,
+                    worker_addrs,
+                    plan.process,
+                    plan.combine,
+                    items[a],
+                    self._steal,
+                    self.monitor is not None,
+                    factory,
+                )
+                for a in worker_addrs
+            ]
+            http_driver_handshake(driver_t, worker_addrs, timeout_s=60.0)
+            return self._collect_peer(driver_t, plan, n, futs)
+        finally:
+            driver_t.close()
+            if not self._persistent:
+                pool.shutdown()
+
+    def _collect_peer(self, driver_t: Any, plan: Plan[R], n: int, futs: list[Future[Any]]) -> R:
+        """Wait for the root while watching the worker futures: a worker exception means the root will
+        never form, so we must detect it PROMPTLY (not after the 300s safety timeout) and re-raise it
+        intact (a picklable ``StageError``, M6 obligation). Also records each worker's witness stats."""
+        if n == 0:
+            driver_t.broadcast(("done",))
+            self._last_peer_witness = [f.result() for f in futs]
+            return plan.empty()
+        deadline = time.monotonic() + 300.0
+        root: Any = _PEER_PENDING
+        while root is _PEER_PENDING:
+            got = driver_t.recv(timeout=0.05)
+            if got is not None and got[1][0] == "root":
+                root = got[1][1]
+                break
+            if got is not None:
+                self._forward_peer_events(got[1])  # worker STARTED/FINISHED/ERRORED -> monitor
+            for f in futs:  # a dead worker -> re-raise the real cause now, not 300s from now
+                if f.done() and f.exception() is not None:
+                    driver_t.broadcast(("done",))
+                    f.result()
+            if time.monotonic() >= deadline:
+                driver_t.broadcast(("done",))
+                raise TimeoutError("peer reduction did not produce a root within 300s")
+        driver_t.broadcast(("done",))
+        # drain trailing monitor events until every worker has finished (else late FINISHED/ERRORED
+        # events, shipped after the root formed, would be lost).
+        while not all(f.done() for f in futs):
+            got = driver_t.recv(timeout=0.02)
+            if got is not None:
+                self._forward_peer_events(got[1])
+        for _sender, payload in driver_t.poll():
+            self._forward_peer_events(payload)
+        self._last_peer_witness = [f.result() for f in futs]  # propagate any error even on success
+        return cast(R, root)
 
     def _pool(self) -> _PoolExecutor:
         factory = self.monitor.worker_profiler_factory() if self.monitor is not None else None
@@ -674,6 +1032,7 @@ class ProcessExecutor(_BaseExecutor):
     def close(self) -> None:
         super().close()
         self._stop_collector()
+        self._close_peer()
         if self._mgr is not None:
             self._mgr.shutdown()
             self._mgr = None

@@ -147,13 +147,44 @@ are byte-identical whether or not a monitor (even a profiling one) is attached. 
 strictly a side channel, never part of the computation.
 
 
+Inter-worker comms: peer reduction + work-stealing (M38)
+--------------------------------------------------------
+
+By default (``comms="ipc"``) the reduction runs **across the workers, off the driver**. The seam is
+:class:`graphed_core.execution.WorkerTransport` — an addressable, non-blocking, best-effort message
+channel — with two backends: **IPC** (queues; ``QueueTransport``) for a single machine, and **HTTP**
+(loopback ``http.server`` + a discovery handshake; ``HttpTransport``) as the path a real distributed
+scheduler reuses. Determinism is *not* the transport's job; it is the reduction protocol's.
+
+* **Peer reduction** (``_peer.py``). Each worker owns a contiguous **leaf range** and reduces it with
+  the lazy index tree (``_reduce.LazyReducer`` — the same fixed ``plan_tree``, computed by index
+  arithmetic, frontier-bounded so N can be huge with no O(N) pre-pass). Partials that straddle a range
+  boundary are handed **worker→worker** by ownership (a segment-tree merge: node ``(level,pos)`` is
+  owned by the worker holding its leftmost leaf; an odd node is shipped to its parent's owner). Every
+  node keeps its **global** ``(level,pos)`` identity, so distributing the *combines* never changes the
+  *grouping* — the result is **bit-for-bit identical to the old driver-hub path even for
+  non-associative float histograms**. The driver only collects the root (a ``done`` broadcast
+  terminates); a worker failure is detected promptly and re-raised intact (the M7 obligation). On the
+  real ADL benchmark this is within noise of the hub — the driver is no longer the combine bottleneck.
+* **Work-stealing**. An idle worker steals **one** leaf from a busy peer's far end
+  (Blumofe–Leiserson/Cilk — *not* steal-half, which under many idle thieves drains a victim
+  geometrically and over-concentrates work). Stealing redistributes only the ``process`` work — the
+  leaf's **owner still reduces it** (the thief ships the partial back), so the tree and the result are
+  unchanged. An idle delay + exponential backoff make it free on balanced loads (no spurious steals)
+  while rebalancing a genuine straggler.
+* **Parity with the hub.** Peer emits the full monitor lifecycle (SUBMITTED/STARTED/FINISHED/ERRORED +
+  the combine count) and runs the off-thread profiler, so the live dashboard — flamegraph included —
+  works under peer. ``comms=None`` selects the legacy driver-hub path (still used for
+  ``pooled_combines`` and the broadcast-cache tests); peer **refuses** ``pooled_combines`` loudly
+  rather than silently degrading to hub.
+
+
 Phase 2 (deliberately not built)
 --------------------------------
 
-* **Distributed executors** (TaskVine / HTCondor / Slurm / Dask) — the entire point of the
-  ``Plan`` contract is that they can be written against it later; the MVP is single-machine
-  only.
-* **Work stealing between pools** and NUMA-aware placement.
+* **Distributed executors** (TaskVine / HTCondor / Slurm / Dask) — the ``Plan`` contract *and* the
+  ``WorkerTransport`` seam are built so they can be written against later; the MVP is single-machine.
+* NUMA-aware placement.
 * **Adaptive chunk-size policies** shipped as library code (the ``next_tasks`` hook exists;
   policies beyond tests are user-land for now).
 * **Per-query resource hints** (memory-bound combinatoric stages want fewer concurrent

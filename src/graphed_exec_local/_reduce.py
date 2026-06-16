@@ -13,9 +13,10 @@ consequences the milestone needs:
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
-from typing import TypeVar
+from typing import Generic, TypeVar
 
 R = TypeVar("R")
+_MISSING = object()
 
 # one combine: result node `out` = combine(node `a`, node `b`), with a < b (left-right, deterministic)
 Combine = tuple[int, int, int]
@@ -89,6 +90,93 @@ def tree_reduce(
             fire_ready(out, work)
 
     return ready[root], n_combines
+
+
+class LazyReducer(Generic[R]):
+    """A **lazy** deterministic tree reducer (M38): the SAME fixed binary tree as :func:`plan_tree`,
+    but its combine partners are computed by index arithmetic on the fly — it never materialises the
+    combine list / waiting-sets, so N can be huge without an O(N) pre-pass.
+
+    A partial enters at leaf position ``leaf`` (level 0). A node at ``(level, pos)`` combines with its
+    sibling ``pos ^ 1`` to form ``(level+1, pos >> 1)``, with the **even** position the left operand
+    and the **odd** the right — the exact left/right grouping of :func:`plan_tree`, so the result is
+    bit-for-bit identical regardless of the order leaves are fed. A node whose sibling position lies
+    past the (odd-sized) level's end is *unpaired* and carries up unchanged. Only nodes still waiting
+    for a sibling are held (``present``) — the live **frontier**, O(log N) for roughly in-order
+    completion, never the whole tree. Peer reduction (P3) reuses this per worker over a leaf range."""
+
+    def __init__(
+        self,
+        n: int,
+        combine: Callable[[R, R], R],
+        empty: Callable[[], R],
+        *,
+        on_combine: Callable[[int], None] | None = None,
+    ) -> None:
+        self.n = n
+        self._combine = combine
+        self._empty = empty
+        self._on_combine = on_combine
+        self._present: dict[tuple[int, int], R] = {}
+        self.n_combines = 0
+        self.delivered = 0
+        self.max_frontier = 0  # largest live frontier seen (test/diagnostic: proves no O(N) blowup)
+
+    def _level_size(self, level: int) -> int:
+        return (self.n + (1 << level) - 1) >> level
+
+    def feed(self, leaf: int, value: R) -> None:
+        """Deliver one partial (leaf index + value), bubbling it up as far as siblings allow."""
+        self.delivered += 1
+        level, pos = 0, leaf
+        present = self._present
+        while True:
+            if self._level_size(level) == 1:  # reached the root
+                present[(level, pos)] = value
+                break
+            if pos % 2 == 0:
+                if pos + 1 >= self._level_size(level):  # unpaired (last node of an odd level) -> carry
+                    level, pos = level + 1, pos >> 1
+                    continue
+                sib = pos + 1
+            else:
+                sib = pos - 1
+            other = present.pop((level, sib), _MISSING)
+            if other is _MISSING:  # sibling not here yet -> park on the frontier and wait
+                present[(level, pos)] = value
+                break
+            left, right = (value, other) if pos % 2 == 0 else (other, value)
+            value = self._combine(left, right)  # type: ignore[arg-type]  # _MISSING handled above
+            self.n_combines += 1
+            if self._on_combine is not None:
+                self._on_combine(self.delivered)
+            level, pos = level + 1, pos >> 1
+        if len(present) > self.max_frontier:
+            self.max_frontier = len(present)
+
+    def result(self) -> R:
+        """The reduced value. Valid once all ``n`` leaves have been fed (the root has formed)."""
+        if self.n == 0:
+            return self._empty()
+        level = 0
+        while self._level_size(level) > 1:
+            level += 1
+        return self._present[(level, 0)]
+
+
+def lazy_tree_reduce(
+    n: int,
+    completed: Iterable[tuple[int, R]],
+    combine: Callable[[R, R], R],
+    empty: Callable[[], R],
+    *,
+    on_combine: Callable[[int], None] | None = None,
+) -> tuple[R, int]:
+    """Lazy equivalent of :func:`tree_reduce` (same bit-for-bit result, no pre-built combine graph)."""
+    reducer: LazyReducer[R] = LazyReducer(n, combine, empty, on_combine=on_combine)
+    for leaf, value in completed:
+        reducer.feed(leaf, value)
+    return reducer.result() if n else empty(), reducer.n_combines
 
 
 def running_fold(

@@ -5,6 +5,10 @@ over many distinct plans accumulated every compiled-IR-bearing process for the w
 lifetime. M34 bounds that cache (FIFO, cap _SHARED_CACHE_CAP) in lockstep with the driver's
 broadcast-token set, asserts full worker coverage before caching a token (never a silent
 under-prime), and reuses the one canonical bounded LocalResources from graphed_core (P3-6/P0-1).
+
+M38: these broadcast-cache tests pin ``comms=None`` (the hub path). The ship-once broadcast is a
+hub mechanism — peer reduction ships the process to each worker directly (no per-worker token cache) —
+so after peer became the default ``comms``, the broadcast cache is exercised explicitly via ``comms=None``.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ def test_local_resources_is_the_canonical_core_one() -> None:
 
 
 def test_shared_cache_stays_bounded_across_many_distinct_plans() -> None:
-    with ProcessExecutor(max_workers=2, persistent=True) as ex:
+    with ProcessExecutor(comms=None, max_workers=2, persistent=True) as ex:
         for i in range(_SHARED_CACHE_CAP + 6):  # more distinct processes than the cap
             assert ex.run(_plan(cache_probe.Tagged(i))).value == cache_probe.Tagged(i).i * 2
         size = ex.run(_plan(cache_probe.cache_size)).value // 2  # both tasks return the same size
@@ -37,7 +41,7 @@ def test_shared_cache_stays_bounded_across_many_distinct_plans() -> None:
 
 
 def test_an_evicted_plan_still_runs_correctly_after_rebroadcast() -> None:
-    with ProcessExecutor(max_workers=2, persistent=True) as ex:
+    with ProcessExecutor(comms=None, max_workers=2, persistent=True) as ex:
         first = cache_probe.Tagged(0)
         ex.run(_plan(first))
         for i in range(1, _SHARED_CACHE_CAP + 4):  # evict `first` from the cache
@@ -49,5 +53,5 @@ def test_an_evicted_plan_still_runs_correctly_after_rebroadcast() -> None:
 def test_broadcast_covers_every_worker() -> None:
     # each worker that runs a task must have been primed (else _proc_task_shared KeyErrors);
     # a clean run over more tasks than workers exercises full coverage
-    with ProcessExecutor(max_workers=4, persistent=True) as ex:
+    with ProcessExecutor(comms=None, max_workers=4, persistent=True) as ex:
         assert ex.run(_plan(cache_probe.Tagged(7), n_tasks=40)).value == 7 * 40
