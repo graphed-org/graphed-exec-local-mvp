@@ -99,10 +99,25 @@ would move several leaves per request, so `given` < leaves shed — these assert
 test the anti-cascade *mechanism* directly and are transport/timing independent. Sanctioned refreeze
 (`--allow-refreeze tests/frozen/m38`); validated stable across repeated ipc+http runs.
 
+## Post-freeze CI fix #3: a flaky wall-clock speedup assert (freeze-M38-2 → freeze-M38-3)
+
+Same test, the NEXT assertion flaked on the slow legs: `assert dt_steal < dt_nosteal` saw
+`1.86 < 1.78` (steal run marginally SLOWER). On a loaded/slow CI runner the ~0.1 s of heavy work is
+dwarfed by process-startup + http-transport noise (both runs measured ~1.8 s, ~15× the ~0.12 s ideal),
+so a wall-clock speedup comparison is inherently flaky and proves nothing the witnesses don't. Removed
+the `time.perf_counter()` measurements + the assert; the speedup is witnessed **structurally** instead:
+`wit[0]["processed"] < w0_nosteal["processed"]` — with stealing the heavy owner runs strictly fewer of
+its own leaves, so the heavy work is genuinely off its critical path (the whole point of stealing),
+deterministically and with no wall-clock dependence. This was the last timing-dependent assertion in
+the m38 suite (grep-verified). Sanctioned refreeze (`--allow-refreeze tests/frozen/m38`).
+
+**Lesson (recorded):** a frozen test must assert deterministic INVARIANTS, never wall-clock timing or
+emergent scheduling distributions — both flake on slow/contended CI even when the mechanism is correct.
+
 ## Gates
 
 `tests/frozen/m38` (94 tests) green on both backends; frozen coverage 94% (≥90 line+branch);
-ruff + ruff format + mypy --strict clean; sphinx -W. Freeze tag `freeze-M38-2`.
+ruff + ruff format + mypy --strict clean; sphinx -W. Freeze tag `freeze-M38-3`.
 
 ## Deferred (Phase-2 within M38)
 

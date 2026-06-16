@@ -45,15 +45,11 @@ def test_witness_stealing_redistributes_and_stays_correct(kind: str) -> None:
     seq = SequentialRunner().run(plan).value
 
     nosteal = ProcessExecutor(max_workers=4, comms=kind, steal=False)
-    t0 = time.perf_counter()
     r0 = nosteal.run(plan)
-    dt_nosteal = time.perf_counter() - t0
     w0_nosteal = nosteal._last_peer_witness[0]
 
     steal = ProcessExecutor(max_workers=4, comms=kind, steal=True)
-    t1 = time.perf_counter()
     r1 = steal.run(plan)
-    dt_steal = time.perf_counter() - t1
     wit = steal._last_peer_witness
 
     # correctness: identical to no-stealing AND to the canonical baseline (stealing only moves work)
@@ -78,8 +74,13 @@ def test_witness_stealing_redistributes_and_stays_correct(kind: str) -> None:
     assert wit[0]["given"] + wit[0]["processed"] == N // 4  # owner's range = run-here + shed-one-by-one
     assert sum(w["given"] for w in wit) == sum(w["steals"] for w in wit)  # each shed leaf stolen once
 
-    # ...and it paid off: redistributing the heavy leaves across workers is faster
-    assert dt_steal < dt_nosteal
+    # ...and it pays off: the point of stealing is a shorter critical path, witnessed STRUCTURALLY
+    # rather than by wall clock — without stealing worker 0 runs all 4 heavy leaves serially
+    # (w0_nosteal.processed == 4); with stealing it runs strictly fewer (asserted above), so the heavy
+    # work is genuinely off its critical path. A wall-clock `dt_steal < dt_nosteal` assert is NOT used:
+    # on a loaded/slow CI runner the ~0.1 s of heavy work is dwarfed by process+transport noise, making
+    # the comparison flaky without proving anything the redistribution witnesses don't already.
+    assert wit[0]["processed"] < w0_nosteal["processed"]  # stealing shortened the heavy owner's path
 
 
 def test_steal_thread_executor_is_correct_and_redistributes() -> None:

@@ -143,7 +143,7 @@
     "M38": {
       "dispute_count": 0,
       "escalated": false,
-      "freeze_tag": "freeze-M38-2",
+      "freeze_tag": "freeze-M38-3",
       "gates": {
         "benchmark": null,
         "coverage": true,
