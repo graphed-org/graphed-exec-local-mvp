@@ -93,7 +93,7 @@ def test_thread_profiling_runs_profiler_in_process() -> None:
     mon = ProfMonitor()
     tasks = [Task(k, Partition(f"f{k}.root", "Events", 0, (k + 1) * 3)) for k in range(4)]
     plan = Plan(process=count_entries, combine=add, empty=lambda: 0, tasks=tasks)
-    with ThreadExecutor(max_workers=2, monitor=mon) as e:
+    with ThreadExecutor(max_workers=2, monitor=mon, comms=None) as e:  # hub thread-emit path (M37)
         result = e.run(plan)
     assert result.value == sum((k + 1) * 3 for k in range(4))
     assert mon.profiles  # the fake profiler flushed (first task is profile-due) -> on_profile fired

@@ -1,6 +1,10 @@
 """M37 frozen suite (graphed-exec-local slice): both reference executors EMIT dashboard events, and
 do so **passively** — attaching a monitor never changes the reduced result, and a misbehaving
 monitor never breaks the run. Worker-side STARTED/FINISHED/ERRORED + driver-side SUBMITTED.
+
+Pinned to ``comms=None`` (the hub monitor seam) since M38: M37 is the hub-path dashboard milestone,
+so these assertions exercise the hub collector. Peer-path emission parity is covered by m38
+(``test_peer_robustness``). The pin changes only the transport, never an assertion.
 """
 
 from __future__ import annotations
@@ -49,7 +53,7 @@ def _plan(n: int = 8) -> tuple[list[Task], Plan[int]]:
 def test_emit_full_phase_sequence(name: str, Executor: type) -> None:
     _, plan = _plan(8)
     rec = Recorder()
-    with Executor(max_workers=3, monitor=rec) as ex:
+    with Executor(max_workers=3, monitor=rec, comms=None) as ex:
         result = ex.run(plan)
     phases = collections.Counter(e.phase for e in rec.events)
     assert phases[TaskPhase.SUBMITTED] == 8
@@ -66,9 +70,9 @@ def test_emit_full_phase_sequence(name: str, Executor: type) -> None:
 @pytest.mark.parametrize("name,Executor", EXECUTORS)
 def test_attaching_a_monitor_is_passive(name: str, Executor: type) -> None:
     _, plan = _plan(8)
-    bare = Executor(max_workers=3).run(plan)
+    bare = Executor(max_workers=3, comms=None).run(plan)
     rec = Recorder()
-    with Executor(max_workers=3, monitor=rec) as ex:
+    with Executor(max_workers=3, monitor=rec, comms=None) as ex:
         observed = ex.run(plan)
     assert observed.value == bare.value
     assert observed.n_combines == bare.n_combines
@@ -81,7 +85,7 @@ def test_errored_task_emits_errored_and_propagates(name: str, Executor: type) ->
     tasks = [Task(0, Partition("bad.root", "Events", 0, 10))]
     plan = Plan(process=boom, combine=add, empty=lambda: 0, tasks=tasks)
     rec = Recorder()
-    with pytest.raises(ValueError, match="boom"), Executor(max_workers=2, monitor=rec) as ex:
+    with pytest.raises(ValueError, match="boom"), Executor(max_workers=2, monitor=rec, comms=None) as ex:
         ex.run(plan)
     errored = [e for e in rec.events if e.phase is TaskPhase.ERRORED]
     assert len(errored) >= 1
@@ -104,6 +108,6 @@ def test_raising_monitor_never_breaks_the_run(name: str, Executor: type) -> None
             return None
 
     _, plan = _plan(6)
-    with Executor(max_workers=3, monitor=Bad()) as ex:
+    with Executor(max_workers=3, monitor=Bad(), comms=None) as ex:
         result = ex.run(plan)
     assert result.value == sum((k + 1) * 5 for k in range(6))

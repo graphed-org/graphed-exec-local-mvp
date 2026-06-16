@@ -47,13 +47,47 @@ sanction):
 - `tests/frozen/m7/test_straggler.py` — incremental `on_combine` ordering is a hub tree-reduce
   property (peer's straggler tolerance is work-stealing, covered by the M38 steal suite).
 
-Every other frozen suite (m7/m31/m37 incl. the dashboard capstone + profiling) passes UNCHANGED under
-the peer default. Cross-repo smoke (`scripts/test_all_repos.py`): all 11 repos green under the flip.
+Three further hub-mechanism tests were pinned to `comms=None` in the post-freeze coverage fix below
+(`m37/test_emit.py`, `m37/test_inprocess_paths.py`, `m31/test_ship_process_once.py`) to RESTORE
+hub-path coverage the flip had moved onto the peer path — same rationale, no assertion weakened. The
+m37 dashboard capstone + profiling pass UNCHANGED on the peer default. Cross-repo smoke
+(`scripts/test_all_repos.py`): all 11 repos green under the flip.
+
+## Post-freeze CI fix: the coverage gate (freeze-M38-0 → freeze-M38-1)
+
+`freeze-M38-0` was pushed with all local precommit checks green, but CI went **red on every matrix
+leg**: `Coverage failure: total of 86 is less than fail-under=90`. The local precommit ran `pytest -q`
+(no coverage); CI runs `pytest tests/frozen --cov=graphed_exec_local --cov-branch` — so an
+under-covered diff passed locally and only failed in CI. Two causes, both consequences of the
+**default flip to peer**:
+
+1. **Subprocess-only actors.** `ipc_peer_actor` / `http_peer_actor` are the picklable entry points
+   `ProcessExecutor` submits to its worker pool, so in a real run they execute in *worker processes*
+   where the driver's coverage instrumentation can't see them (the same gap M37 closed for the hub
+   worker entry via `test_inprocess_paths`). Closed with a **new frozen file**
+   `tests/frozen/m38/test_inprocess_peer.py` (7 tests): it drives the EXACT `_peer_ipc` / `_peer_http`
+   discovery+reduction protocol the executor uses, but with the actors running in threads, so the
+   actor bodies + the worker-process resource cache are exercised under instrumentation — WITNESSED
+   end-to-end (root bit-for-bit == the flat tree), plus the `collect_peer_root` timeout and the
+   `run_peer_worker` done-via-prebuffer paths.
+2. **Hub-path coverage lost to the flip.** The hub monitor collector (`_ensure_collector` /
+   `_collect_loop` / `_dispatch`) and the ship-once `_broadcast` were covered by m37/m31 tests that —
+   under the new peer default — now run the PEER path, leaving the hub code uncovered. Restored by
+   pinning the hub-mechanism tests to `comms=None` (their original M37/M31 intent; peer-path parity is
+   covered by m38 `test_peer_robustness`): `m37/test_emit.py`, `m37/test_inprocess_paths.py`,
+   `m31/test_ship_process_once.py`. (`m37/test_capstone_dashboard.py` stays on the peer default — its
+   `inflight` drain assertion is peer-shaped, and `test_emit`'s process+monitor variant already covers
+   the hub collector.) No assertion was weakened; only the transport was pinned to the path each test
+   was written to exercise.
+
+Result: frozen-suite coverage **94%** (`_peer` 92, `_reduce` 97, `_transport` 96, `executors` 93).
+The precommit gate itself was upgraded to run each repo's own CI `--cov` command (graphed-orchestrator
+`precommit.check_coverage`), so this class of "green locally, red in CI" can't recur.
 
 ## Gates
 
-`tests/frozen/m38` (87 tests) green on both backends; ruff + ruff format + mypy --strict clean;
-sphinx -W. Freeze tag `freeze-M38-0`.
+`tests/frozen/m38` (94 tests) green on both backends; frozen coverage 94% (≥90 line+branch);
+ruff + ruff format + mypy --strict clean; sphinx -W. Freeze tag `freeze-M38-1`.
 
 ## Deferred (Phase-2 within M38)
 

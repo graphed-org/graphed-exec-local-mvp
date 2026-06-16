@@ -143,7 +143,7 @@
     "M38": {
       "dispute_count": 0,
       "escalated": false,
-      "freeze_tag": "freeze-M38-0",
+      "freeze_tag": "freeze-M38-1",
       "gates": {
         "benchmark": null,
         "coverage": true,
@@ -166,6 +166,21 @@
           "iteration_index": 0,
           "lint_ok": true,
           "pass_count": 87,
+          "tokens_spent": 0,
+          "tree_hash": "local",
+          "types_ok": true,
+          "wall_clock_s": 0.0
+        },
+        {
+          "benchmark_ok": true,
+          "coverage_ok": true,
+          "determinism_ok": true,
+          "diff_lines": 0,
+          "fail_set_hash": "e3b0c44298fc1c14",
+          "integrity_ok": true,
+          "iteration_index": 1,
+          "lint_ok": true,
+          "pass_count": 94,
           "tokens_spent": 0,
           "tree_hash": "local",
           "types_ok": true,
