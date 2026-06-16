@@ -69,11 +69,14 @@ def test_witness_stealing_redistributes_and_stays_correct(kind: str) -> None:
     assert wit[0]["processed"] < N // 4  # ...and therefore ran fewer than its 4 assigned
     assert sum(w["steals"] for w in wit) > 0  # peers stole work
 
-    # anti-cascade witness (steal-ONE, not steal-half): the heavy worker's leaves spread across
-    # MULTIPLE thieves rather than over-concentrating on the first one — a victim drained by several
-    # idle thieves is not emptied into a single peer.
-    thieves = [i for i, w in enumerate(wit) if w["steals"] > 0]
-    assert len(thieves) >= 2
+    # anti-cascade witness (steal-ONE, not steal-half): the heavy owner sheds leaves ONE AT A TIME —
+    # the number of grants equals the number of leaves it gave up, and every shed leaf is stolen by
+    # exactly one peer. A steal-HALF grant would move several leaves per request (so `given` would be
+    # < the leaves shed — a victim emptied into a single bulk transfer); steal-one structurally cannot.
+    # (How many DISTINCT peers catch those one-at-a-time grants is a scheduling-timing detail — on a
+    # slow transport one quick peer may catch several — so it is deliberately NOT asserted.)
+    assert wit[0]["given"] + wit[0]["processed"] == N // 4  # owner's range = run-here + shed-one-by-one
+    assert sum(w["given"] for w in wit) == sum(w["steals"] for w in wit)  # each shed leaf stolen once
 
     # ...and it paid off: redistributing the heavy leaves across workers is faster
     assert dt_steal < dt_nosteal

@@ -84,10 +84,25 @@ Result: frozen-suite coverage **94%** (`_peer` 92, `_reduce` 97, `_transport` 96
 The precommit gate itself was upgraded to run each repo's own CI `--cov` command (graphed-orchestrator
 `precommit.check_coverage`), so this class of "green locally, red in CI" can't recur.
 
+## Post-freeze CI fix #2: a flaky steal witness (freeze-M38-1 → freeze-M38-2)
+
+`freeze-M38-1` passed local checks + CI on Linux but went red on the **slower macOS/Windows legs**:
+`test_steal.py::test_witness_stealing_redistributes_and_stays_correct[http]` —
+`assert len(thieves) >= 2` saw only 1. This was an over-specified, timing-dependent assertion: with
+**steal-ONE** + a slow (http) transport, one quick idle peer can catch several of the heavy owner's
+one-at-a-time grants before others' requests arrive, so the number of DISTINCT thieves is a scheduling
+detail, not an invariant — the run is still correct (every other witness passed). Replaced with the
+**deterministic** steal-one invariant that the original line was a flaky proxy for:
+`wit[0]["given"] + wit[0]["processed"] == N//4` (the owner's range = leaves it ran + leaves it shed
+one-at-a-time) and `sum(given) == sum(steals)` (each shed leaf stolen exactly once). A steal-HALF grant
+would move several leaves per request, so `given` < leaves shed — these asserts would catch it; they
+test the anti-cascade *mechanism* directly and are transport/timing independent. Sanctioned refreeze
+(`--allow-refreeze tests/frozen/m38`); validated stable across repeated ipc+http runs.
+
 ## Gates
 
 `tests/frozen/m38` (94 tests) green on both backends; frozen coverage 94% (≥90 line+branch);
-ruff + ruff format + mypy --strict clean; sphinx -W. Freeze tag `freeze-M38-1`.
+ruff + ruff format + mypy --strict clean; sphinx -W. Freeze tag `freeze-M38-2`.
 
 ## Deferred (Phase-2 within M38)
 
