@@ -114,10 +114,22 @@ the m38 suite (grep-verified). Sanctioned refreeze (`--allow-refreeze tests/froz
 **Lesson (recorded):** a frozen test must assert deterministic INVARIANTS, never wall-clock timing or
 emergent scheduling distributions — both flake on slow/contended CI even when the mechanism is correct.
 
+## Post-freeze CI fix #4: steal-engagement window too tight for slow CI (freeze-M38-3 → freeze-M38-4)
+
+With the timing-comparison asserts gone, the ENGAGEMENT witnesses themselves (`given > 0`, `steals >
+0`) flaked on the two slowest legs (macOS/Windows py3.13): they saw 0. Work-stealing engagement is
+intrinsically timing-gated — an idle peer's steal request must reach the busy owner *before* it
+finishes its range — and the 4×0.03=0.12 s owner window was too tight: on a heavily contended runner
+the steal handshake (idle-gate + transport + scheduling) didn't always land before the owner was done,
+so no steal occurred even though the mechanism is correct. Fix is **scenario sizing**, not the
+assertion: `HEAVY` 0.03 → 0.2 (a ~0.8 s owner window vs a few-ms handshake — ~16× margin). The asserts
+stay on the structural counters (`given`/`steals`), per R0.10a; only the window the scenario leaves for
+engagement grew. No `--allow-refreeze` shape change beyond `tests/frozen/m38`.
+
 ## Gates
 
 `tests/frozen/m38` (94 tests) green on both backends; frozen coverage 94% (≥90 line+branch);
-ruff + ruff format + mypy --strict clean; sphinx -W. Freeze tag `freeze-M38-3`.
+ruff + ruff format + mypy --strict clean; sphinx -W. Freeze tag `freeze-M38-4`.
 
 ## Deferred (Phase-2 within M38)
 

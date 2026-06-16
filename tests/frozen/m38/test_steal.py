@@ -14,7 +14,14 @@ from graphed_core.execution import SequentialRunner
 
 from graphed_exec_local.executors import ProcessExecutor, ThreadExecutor
 
-HEAVY, LIGHT, N = 0.03, 0.001, 16  # 4 workers -> worker 0 owns leaves 0..3, all heavy
+# 4 workers -> worker 0 owns leaves 0..3, all heavy; workers 1-3 own light leaves and go idle almost
+# at once. HEAVY is deliberately LARGE (a ~0.8 s owner window vs a few-ms steal handshake): steal
+# ENGAGEMENT is intrinsically timing-gated (an idle peer's request must reach the busy owner before it
+# finishes), so the witnesses below assert structural counters (`given`/`steals`) while the scenario
+# leaves a wide enough window that engagement is reliable even on a heavily contended macOS/Windows CI
+# runner. (A tight 0.12 s window flaked there — the handshake didn't always land before the owner was
+# done. This sizes the window, not the assertion: per R0.10a the assert is on the counter, not a clock.)
+HEAVY, LIGHT, N = 0.2, 0.001, 16
 
 
 def _work(partition: Partition, resources: object) -> int:
