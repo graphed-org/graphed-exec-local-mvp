@@ -1,8 +1,8 @@
 """M37 capstone (graphed-exec-local slice): a real ``ProcessExecutor`` run with a live ``Dashboard``
 attached — the cross-process + network plumbing end-to-end. Worker events forward over the in-process
 side-queue to the driver collector, then over a **websocket** to the Perspective ``DashboardServer``;
-per-worker pyinstrument sessions ride the same path and the server flattens them into profile rows.
-The reduced result is **unchanged** by the dashboard's presence.
+per-worker off-thread sampler stack-trees ride the same path and the server merges them into one
+flamegraph. The reduced result is **unchanged** by the dashboard's presence.
 
 graphed-debug is a runtime dependency of this package, so importing ``Dashboard`` is in-deps (R13.8);
 the dashboard *extra* (perspective/tornado/websocket) is gated with ``importorskip`` so a leg without
@@ -47,9 +47,10 @@ def test_process_executor_with_dashboard_over_the_network() -> None:
         assert snap["stats"]["errored"] == 0
         assert snap["stats"]["inflight"] == 0
 
-        # profiling sessions traversed the same transport and became profile rows (statistical, so
-        # poll briefly; the work is heavy enough to reliably sample)
+        # the off-thread sampler's stack-trees traversed the same transport and merged into the
+        # server flamegraph (statistical, so poll briefly; the work is heavy enough to reliably sample)
         deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and dash.snapshot()["profile_rows"] == 0:
+        while time.monotonic() < deadline and dash.snapshot()["profile_samples"] == 0:
             time.sleep(0.05)
-        assert dash.snapshot()["profile_rows"] > 0
+        assert dash.snapshot()["profile_samples"] > 0
+        assert dash.server.flamegraph()["value"] > 0

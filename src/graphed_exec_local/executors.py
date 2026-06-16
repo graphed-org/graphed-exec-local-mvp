@@ -76,8 +76,8 @@ _PROC_BUFFER_CAP = 50000  # bounded local buffer (drop-oldest on overflow)
 _PROFILE_FLUSH_INTERVAL = 1.0  # serialize the profiler at most ~1/s, never per task
 
 # M37: every statistical profiler we start (thread-local or per-process) is registered here so a
-# single atexit handler can stop it. pyinstrument's sampler timer otherwise outlives the worker and
-# raises "'NoneType' object is not callable" as module globals are torn down at interpreter exit.
+# single atexit handler can stop it — its background sampler thread must be joined before the worker's
+# interpreter tears down module globals, or a late sample touches half-collected state.
 _live_profilers: list[WorkerProfiler] = []
 _profiler_lock = threading.Lock()
 _atexit_registered = False
@@ -190,8 +190,8 @@ def _proc_drain_final() -> None:
 
 
 def _proc_profile_due() -> bool:
-    """True at most once per ``_PROFILE_FLUSH_INTERVAL`` — keeps the (expensive) profiler serialize
-    off the per-task path. Called on the worker thread, where pyinstrument is valid."""
+    """True at most once per ``_PROFILE_FLUSH_INTERVAL`` — keeps the profiler serialize (JSON-encoding
+    the accumulated stack tree) off the per-task path. Called on the worker thread."""
     global _proc_last_flush
     now = time.monotonic()
     if now - _proc_last_flush >= _PROFILE_FLUSH_INTERVAL:
