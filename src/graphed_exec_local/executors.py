@@ -51,12 +51,17 @@ from graphed_debug import StageError
 from ._peer import (
     http_driver_handshake,
     http_peer_actor,
+    lifeline_neighbors,
     make_bounds,
     peer_pool_init,
+    pinned_peer_actor,
+    pinned_peer_init,
     pooled_peer_actor,
     process_and_reduce,
     slice_items,
+    worker_outbox_addresses,
 )
+from ._pinned_pool import PinnedProcessPool
 from ._reduce import plan_tree, running_fold, tree_reduce
 from ._transport import HttpTransport, PipeInbox, QueueTransport, build_transports
 
@@ -76,6 +81,23 @@ def _close_registry(registry: dict[str, Any]) -> None:
     for q in registry.values():
         with contextlib.suppress(Exception):
             q.close()
+
+
+def _use_pinned_pool(w: int) -> bool:
+    """Choose the IPC worker pool. The full-registry ProcessPoolExecutor path (every worker inherits
+    every inbox) is faster for small/medium ``w`` but costs ~``2*(w+1)`` fds per worker; switch to the
+    bounded identity-pinned pool (O(log N) inheritance) before that approaches the per-process fd limit
+    — i.e. on large many-core machines (>128 cores). ``GRAPHED_PEER_PINNED`` forces the choice (tests)."""
+    forced = os.environ.get("GRAPHED_PEER_PINNED")
+    if forced is not None:
+        return forced not in ("", "0", "false", "False")
+    try:
+        import resource  # noqa: PLC0415 — POSIX only
+
+        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except Exception:  # pragma: no cover — Windows / no RLIMIT: assume the conservative macOS default
+        soft = 256
+    return 2 * (w + 1) + 64 > soft // 2  # full-registry fds would exceed half the limit -> go bounded
 
 
 # ---- per-worker resources --------------------------------------------------
@@ -775,10 +797,14 @@ class ProcessExecutor(_BaseExecutor):
         self._collector: threading.Thread | None = None
         self._collector_stop: threading.Event | None = None
         # M38 persistent peer state: reused across run()s when persistent=True so the worker spawn is
-        # paid once, exactly like the hub pool — the fair-benchmark path.
-        self._peer_pool: ProcessPoolExecutor | None = None
+        # paid once, like the hub pool. The full-registry ProcessPoolExecutor path reuses on w; the
+        # identity-pinned path's topology depends on (n, w) so it also keys on n (a repeated plan never
+        # respawns either way).
+        self._peer_pool: ProcessPoolExecutor | PinnedProcessPool | None = None
         self._peer_nworkers = 0
-        self._peer_registry: dict[str, Any] | None = None  # raw mp.Queue per address, inherited by workers
+        self._peer_n = 0
+        self._peer_pinned = False  # which IPC path the live pool is (identity-pinned vs full-registry)
+        self._peer_registry: dict[str, Any] | None = None  # SimpleQueue inbox per address
         self._peer_driver: QueueTransport | None = None
 
     def _close_peer(self) -> None:
@@ -790,6 +816,8 @@ class ProcessExecutor(_BaseExecutor):
             self._peer_registry = None
         self._peer_driver = None
         self._peer_nworkers = 0
+        self._peer_n = 0
+        self._peer_pinned = False
 
     # ---- M38 peer reduction across worker PROCESSES (cross-process transport) ----
 
@@ -817,58 +845,96 @@ class ProcessExecutor(_BaseExecutor):
         items: dict[str, list[tuple[int, Partition]]],
         ctx: Any,
     ) -> R:
-        # IPC across processes: a registry of raw mp.Queues (one inbox per address) is created in the
-        # driver and INHERITED by every worker via the pool initializer (peer_pool_init) — NOT handed in
-        # per-submit. Each actor resolves its inbox + peers' outboxes from that registry by its address
-        # (a cheap submit-arg string). This replaces the old Manager().Queue() proxies, eliminating the
-        # multiprocessing.Manager server process that routed every queue op as a socket-RPC (py-spy
-        # measured it consuming ~30% of sampled thread-time and inflating worker compute under load).
-        # persistent=True reuses the pool + registry across run()s (spawn paid once, like the hub).
+        # IPC across processes, two pools chosen by _use_pinned_pool(w):
+        #  * full-registry ProcessPoolExecutor (small/medium w, the fast common path): every worker
+        #    inherits every SimpleQueue inbox (O(N²) fds — fine while N << the fd limit).
+        #  * identity-pinned PinnedProcessPool (large many-core machines): each worker inherits ONLY its
+        #    inbox + its O(log N) overlay peers (reduction targets + hypercube lifelines + driver), so
+        #    the registry is O(N log N) and stays under the per-process fd limit. Both bound stealing to
+        #    the lifelines. (A *dynamic* cluster — workers joining/dying — needs a lazy-connect transport
+        #    + multi-hop routing over this same overlay: the Phase-2 distributed runtime, which reuses
+        #    worker_outbox_addresses.)
+        pinned = _use_pinned_pool(w)
         addrs = ("driver", *worker_addrs)
         reuse = (
             self._persistent
             and self._peer_pool is not None
+            and self._peer_pinned == pinned
             and self._peer_nworkers == w
+            and (self._peer_n == n or not pinned)  # only the pinned topology depends on n
             and self._peer_registry is not None
             and self._peer_driver is not None
         )
         if reuse:
             pool, registry, driver_t = self._peer_pool, self._peer_registry, self._peer_driver
-            assert registry is not None and driver_t is not None
+            assert pool is not None and registry is not None and driver_t is not None
             for q in registry.values():  # clear any straggler before reuse (a clean run leaves none)
                 _drain_queue(q)
         else:
             self._close_peer()
-            registry = {a: PipeInbox(ctx) for a in addrs}  # SimpleQueue-backed: no per-queue feeder thread
+            registry = {a: PipeInbox(ctx) for a in addrs}  # SimpleQueue inboxes: no per-queue feeder thread
             driver_t = QueueTransport(
                 "driver", registry["driver"], {a: registry[a] for a in addrs if a != "driver"}
             )
-            pool = ProcessPoolExecutor(
-                max_workers=w, mp_context=ctx, initializer=peer_pool_init, initargs=(registry,)
-            )
+            if pinned:
+                outbox = worker_outbox_addresses(n, bounds, worker_addrs)  # address -> its O(log N) peers
+                wi = {a: i for i, a in enumerate(worker_addrs)}
+                init_args = [
+                    (
+                        a,
+                        registry[a],  # this worker's inbox
+                        {t: registry[t] for t in outbox[a]},  # only its O(log N) outboxes (+ driver)
+                        tuple(worker_addrs[j] for j in lifeline_neighbors(wi[a], w)),  # steal lifelines
+                    )
+                    for a in worker_addrs
+                ]
+                pool = PinnedProcessPool(w, ctx, pinned_peer_init, init_args)
+            else:
+                pool = ProcessPoolExecutor(
+                    max_workers=w, mp_context=ctx, initializer=peer_pool_init, initargs=(registry,)
+                )
             if self._persistent:
-                self._peer_pool, self._peer_registry = pool, registry
-                self._peer_driver, self._peer_nworkers = driver_t, w
-        assert pool is not None and registry is not None and driver_t is not None
+                self._peer_pool, self._peer_registry, self._peer_driver = pool, registry, driver_t
+                self._peer_nworkers, self._peer_n, self._peer_pinned = w, n, pinned
         factory = self._peer_profiler_factory()
         try:
-            futs = [
-                pool.submit(
-                    pooled_peer_actor,
-                    a,
-                    n,
-                    bounds,
-                    worker_addrs,
-                    plan.process,
-                    plan.combine,
-                    items[a],
-                    self._steal,
-                    self.monitor is not None,
-                    factory,
-                )
-                for a in worker_addrs
-            ]
-            return self._collect_peer(driver_t, plan, n, futs)
+            if pinned:
+                ppool = cast(PinnedProcessPool, pool)
+                futs = [
+                    ppool.submit(
+                        pinned_peer_actor,
+                        n,
+                        bounds,
+                        worker_addrs,
+                        plan.process,
+                        plan.combine,
+                        items[a],
+                        self._steal,
+                        self.monitor is not None,
+                        factory,
+                        worker=i,
+                    )
+                    for i, a in enumerate(worker_addrs)
+                ]
+            else:
+                fpool = cast("ProcessPoolExecutor", pool)
+                futs = [
+                    fpool.submit(
+                        pooled_peer_actor,
+                        a,
+                        n,
+                        bounds,
+                        worker_addrs,
+                        plan.process,
+                        plan.combine,
+                        items[a],
+                        self._steal,
+                        self.monitor is not None,
+                        factory,
+                    )
+                    for a in worker_addrs
+                ]
+            return self._collect_peer(driver_t, plan, n, futs, pool)
         finally:
             if not self._persistent:
                 pool.shutdown()
@@ -888,9 +954,14 @@ class ProcessExecutor(_BaseExecutor):
         # the driver (known up front), which assembles + broadcasts the registry — real sockets, the
         # path a distributed scheduler takes. persistent=True reuses the worker POOL (spawn paid once);
         # the loopback servers + discovery handshake are re-done per run (workers are per-submit actors).
-        reuse = self._persistent and self._peer_pool is not None and self._peer_nworkers == w
+        reuse = (
+            self._persistent
+            and self._peer_pool is not None
+            and not self._peer_pinned  # HTTP always uses a plain ProcessPoolExecutor, never the pinned pool
+            and self._peer_nworkers == w
+        )
         if reuse:
-            pool = self._peer_pool
+            pool = cast("ProcessPoolExecutor", self._peer_pool)
         else:
             self._close_peer()
             pool = ProcessPoolExecutor(max_workers=w, mp_context=ctx)
@@ -919,13 +990,15 @@ class ProcessExecutor(_BaseExecutor):
                 for a in worker_addrs
             ]
             http_driver_handshake(driver_t, worker_addrs, timeout_s=60.0)
-            return self._collect_peer(driver_t, plan, n, futs)
+            return self._collect_peer(driver_t, plan, n, futs, pool)
         finally:
             driver_t.close()
             if not self._persistent:
                 pool.shutdown()
 
-    def _collect_peer(self, driver_t: Any, plan: Plan[R], n: int, futs: list[Future[Any]]) -> R:
+    def _collect_peer(
+        self, driver_t: Any, plan: Plan[R], n: int, futs: list[Future[Any]], pool: Any = None
+    ) -> R:
         """Wait for the root while watching the worker futures: a worker exception means the root will
         never form, so we must detect it PROMPTLY (not after the 300s safety timeout) and re-raise it
         intact (a picklable ``StageError``, M6 obligation). Also records each worker's witness stats."""
@@ -946,6 +1019,11 @@ class ProcessExecutor(_BaseExecutor):
                 if f.done() and f.exception() is not None:
                     driver_t.broadcast(("done",))
                     f.result()
+            # PinnedProcessPool backstop: a HARD worker crash ships no error + leaves its Future
+            # unresolved, so the future check above can't see it — detect the dead process directly.
+            if pool is not None and not getattr(pool, "workers_alive", lambda: True)():
+                driver_t.broadcast(("done",))
+                raise RuntimeError("a peer worker process died before producing the root")
             if time.monotonic() >= deadline:
                 driver_t.broadcast(("done",))
                 raise TimeoutError("peer reduction did not produce a root within 300s")

@@ -204,9 +204,35 @@ assertion: `HEAVY` 0.03 → 0.2 (a ~0.8 s owner window vs a few-ms handshake —
 stay on the structural counters (`given`/`steals`), per R0.10a; only the window the scenario leaves for
 engagement grew. No `--allow-refreeze` shape change beyond `tests/frozen/m38`.
 
+## P7: sub-quadratic registry inheritance for large many-core machines
+
+The full-registry IPC path inherits **every** inbox into **every** worker — O(N²) queue handles, which
+on a >128-core single machine blows past the per-process fd limit (macOS default 256). Fix: a bounded
+**communication overlay** + an **identity-pinned** worker pool, chosen by `_use_pinned_pool(w)` (the
+full-registry `ProcessPoolExecutor` stays the fast path while N is well under the fd limit; the bounded
+pool kicks in only when it would approach it).
+
+- **Overlay** (`_peer.py`, the *shared* machinery): each worker talks to only O(log N) peers — its
+  reduction targets (a value-free replay of the real `PeerReducer.settle`, so it can't drift) ∪ a
+  symmetric **hypercube lifeline** graph (X10 GLB / HotSLAW — degree & diameter O(log N), scales to
+  thousands) ∪ the driver. Verified degree = log₂w + 1 up to w=128.
+- **`PinnedProcessPool`** (`_pinned_pool.py`): a `concurrent.futures.Executor` of identity-pinned
+  workers — worker `i` is spawned once, runs its own initializer to inherit ONLY its inbox + its
+  O(log N) overlay outboxes (so the registry is O(N log N)), and `submit(fn, *args, worker=i)` targets
+  it. Stealing is bounded to the lifelines. Measured: per-worker fds grow ~log(w) (32 at w=4 → 36 at
+  w=8), not linearly; at w=128 the full-registry path would need ~280 fds/worker (> the macOS limit),
+  the pinned path ~45.
+- **Perf:** small w stays on the full-registry path → notebook benchmark peer-vs-hub **+2.8 %** (no
+  regression; the pinned path alone showed +18.5 % at small w from the reaper/future hop — moot since
+  it's only used at large w, where at W=8 it was already −5.5 %).
+- **Dynamic clusters** (workers joining/dying) need a lazy-connect transport + multi-hop routing over
+  this overlay — recompute + push O(log N) peer lists on membership change, no respawn; rerun lost
+  work. That's the **Phase-2 distributed runtime**; it reuses `worker_outbox_addresses`. Root-prompt
+  R21.5 records the design.
+
 ## Gates
 
-`tests/frozen/m38` (94 tests) green on both backends; frozen coverage 94% (≥90 line+branch);
+`tests/frozen/m38` green on both backends + both IPC pools; frozen coverage ≥90 % (line+branch);
 ruff + ruff format + mypy --strict clean; sphinx -W. Freeze tag `freeze-M38-4`.
 
 ## Deferred (Phase-2 within M38)

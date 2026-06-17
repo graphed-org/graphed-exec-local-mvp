@@ -66,6 +66,96 @@ def worker_of(leaf: int, bounds: list[int]) -> int:
     return max(0, min(len(bounds) - 2, bisect.bisect_right(bounds, leaf) - 1))
 
 
+# ---- bounded communication overlay (M38 P7): O(log N) degree, not all-to-all ------------------
+#
+# To keep the IPC registry sub-quadratic (so a worker inherits O(log N) inbox handles, not all N), and
+# to keep the HTTP transport's connection count sub-quadratic on large farms, each worker talks to only
+# O(log N) peers: its *reduction* partners (the binomial-style segment-tree send targets) plus a fixed
+# *hypercube lifeline* overlay for work-stealing. The lifeline graph (X10 GLB / Saraswat et al.) is a
+# low-degree, low-diameter, symmetric hypercube — work still routes anywhere, scaling to thousands of
+# workers — and hierarchical/lifeline victim selection scales better than random all-to-all (HotSLAW).
+
+
+def lifeline_neighbors(idx: int, w: int) -> set[int]:
+    """Hypercube lifeline neighbours of worker ``idx`` among ``w`` workers: ``idx ^ 2^k`` for each
+    ``2^k < w`` (skipping out-of-range when ``w`` is not a power of two). **Symmetric** (so a steal
+    request and its response use the same edge), degree and diameter O(log w)."""
+    out: set[int] = set()
+    k = 1
+    while k < w:
+        nb = idx ^ k
+        if nb < w:
+            out.add(nb)
+        k <<= 1
+    return out
+
+
+class _EdgeRecorder:
+    """A :class:`graphed_core.execution.WorkerTransport`-shaped stub used only to compute the static
+    reduction topology: it records each ``send`` destination and queues ``node`` hand-offs so a
+    value-free in-process replay of the reduction propagates fully. Reusing the real
+    :meth:`PeerReducer.settle` guarantees the topology never diverges from the runtime reduction."""
+
+    def __init__(self, address: str, edges: dict[str, set[str]], pending: deque[tuple[str, Any]]) -> None:
+        self.address = address
+        self._edges = edges
+        self._pending = pending
+
+    def send(self, dest: str, message: Any) -> bool:
+        self._edges.setdefault(self.address, set()).add(dest)
+        if message[0] == "node":
+            self._pending.append((dest, message))
+        return True
+
+    def poll(self) -> list[tuple[str, Any]]:
+        return []
+
+    def recv(self, timeout: float | None = None) -> tuple[str, Any] | None:
+        return None
+
+    def broadcast(self, message: Any) -> None: ...
+    def peers(self) -> tuple[str, ...]:
+        return ()
+
+    def close(self) -> None: ...
+
+
+def reduction_edges(n: int, bounds: list[int], worker_addresses: tuple[str, ...]) -> dict[str, set[str]]:
+    """Per worker, the set of addresses it sends reduction partials to (incl. ``DRIVER`` for the root
+    holder). A static, value-free replay of the real reduction — deterministic from ``(n, bounds)``."""
+    edges: dict[str, set[str]] = {}
+    pending: deque[tuple[str, Any]] = deque()
+    reducers = {
+        a: PeerReducer(a, _EdgeRecorder(a, edges, pending), n, bounds, worker_addresses, lambda x, y: 1)
+        for a in worker_addresses
+    }
+    for leaf in range(n):
+        reducers[worker_addresses[worker_of(leaf, bounds)]].settle(0, leaf, 1)
+    while pending:
+        dest, message = pending.popleft()
+        reducers[dest].settle(message[1], message[2], message[3])
+    return edges
+
+
+def worker_outbox_addresses(
+    n: int, bounds: list[int], worker_addresses: tuple[str, ...]
+) -> dict[str, set[str]]:
+    """For each worker address, the bounded set of peer addresses it must be able to send to:
+    reduction targets + symmetric hypercube lifelines + ``DRIVER``. O(log N) per worker, so the IPC
+    registry a worker inherits (its inbox + these peers' inboxes) is O(log N), total O(N log N)."""
+    redges = reduction_edges(n, bounds, worker_addresses)
+    w = len(worker_addresses)
+    idx = {a: i for i, a in enumerate(worker_addresses)}
+    out: dict[str, set[str]] = {}
+    for a in worker_addresses:
+        peers = set(redges.get(a, set()))  # reduction targets (may include DRIVER)
+        peers |= {worker_addresses[j] for j in lifeline_neighbors(idx[a], w)}  # steal lifelines
+        peers.add(DRIVER)  # events + witness + (for w0) the root
+        peers.discard(a)
+        out[a] = peers
+    return out
+
+
 class PeerReducer(Generic[R]):
     """Per-worker reduction state: feed local partials + peer nodes, keep/route/park by ownership,
     bubbling up the one global fixed tree. Worker 0 forms and ships the root to the driver."""
@@ -227,6 +317,7 @@ def process_and_reduce(
     resources: LocalResources,
     *,
     steal: bool = True,
+    steal_peers: tuple[str, ...] | None = None,
     emit: bool = False,
     profiler_factory: Callable[[], Any] | None = None,
     prebuffered: Sequence[tuple[str, Any]] = (),
@@ -247,7 +338,9 @@ def process_and_reduce(
     reducer: PeerReducer[R] = PeerReducer(address, transport, n, bounds, worker_addresses, combine)
     mine: deque[tuple[int, Partition]] = deque(items)  # leaves to PROCESS (own + stolen)
     seen: set[tuple[int, int]] = set()  # dedup settled nodes/leaves (a reliable transport may retry)
-    peers = tuple(a for a in worker_addresses if a != address)
+    # victims this worker may steal from: the bounded lifeline overlay when given (O(log N), so the IPC
+    # registry stays sub-quadratic), else every peer (the in-process / full-mesh case).
+    peers = steal_peers if steal_peers is not None else tuple(a for a in worker_addresses if a != address)
     stats = {"steals": 0, "given": 0, "processed": 0}
     victim = 0
     idle_since: float | None = None  # when this worker ran out of local work (gates the steal delay)
@@ -405,10 +498,27 @@ def _worker_proc_resources() -> LocalResources:
     return _peer_proc_resources
 
 
-def ipc_peer_actor(
-    address: str,
-    inbox: Any,
-    outboxes: dict[str, Any],
+# ---- identity-pinned worker specialisation (M38 P7), driven by PinnedProcessPool -----------------
+#
+# An identity-pinned worker is spawned ONCE, owns ``address`` for life, and inherits ONLY its inbox +
+# the outboxes of its O(log N) overlay peers (so the IPC registry is sub-quadratic, not O(N²)). The
+# pool delivers each run's ``_pinned_peer_actor`` call over a per-worker control channel SEPARATE from
+# the reduction transport, so reduction/steal messages that race ahead simply wait in the transport
+# inbox (no buffering hack) and the witness/error come back as the call's Future result.
+
+_pinned: tuple[str, Any, tuple[str, ...]] | None = None  # (address, transport, steal_peers) per worker
+
+
+def pinned_peer_init(
+    address: str, inbox: Any, outboxes: dict[str, Any], steal_peers: tuple[str, ...]
+) -> None:
+    """``PinnedProcessPool`` per-worker initializer: stash this worker's identity + its inherited
+    transport (inbox + the O(log N) outboxes) + its steal lifelines as a process global."""
+    global _pinned
+    _pinned = (address, QueueTransport(address, inbox, outboxes), steal_peers)
+
+
+def pinned_peer_actor(
     n: int,
     bounds: list[int],
     worker_addresses: tuple[str, ...],
@@ -419,11 +529,10 @@ def ipc_peer_actor(
     emit: bool = False,
     profiler_factory: Callable[[], Any] | None = None,
 ) -> dict[str, int]:
-    """Module-level (picklable) IPC actor: build the queue transport from the ``inbox``/``outboxes``
-    handed in, then process + peer-reduce. The ``ProcessExecutor`` reaches this via
-    :func:`pooled_peer_actor` (registry-resolved queues); callers may also pass queues explicitly.
-    Reuses the process resource cache across runs (file locality for a persistent pool)."""
-    transport = QueueTransport(address, inbox, outboxes)
+    """One run of the pinned worker: peer-reduce its leaves over the inherited transport, return the
+    witness (the call's Future carries it back, and re-raises a worker error intact — M6/M7)."""
+    assert _pinned is not None, "pinned_peer_init must run as the pool worker initializer"
+    address, transport, steal_peers = _pinned
     return process_and_reduce(
         address,
         transport,
@@ -435,23 +544,27 @@ def ipc_peer_actor(
         items,
         _worker_proc_resources(),
         steal=steal,
+        steal_peers=steal_peers,
         emit=emit,
         profiler_factory=profiler_factory,
         close_resources=False,
     )
 
 
-# Per-WORKER-PROCESS inbox/outbox registry, INHERITED via the pool initializer (``peer_pool_init``)
-# rather than handed in as picklable Manager proxies. This removes the ``multiprocessing.Manager``
-# *server* process the IPC path used to route every queue op through — py-spy showed that server
-# consuming ~30 % of sampled thread-time as a socket-RPC hub, contention that inflated the workers'
-# compute under load. Raw ``mp.Queue``s instead talk worker<->worker over native pipes.
+# ---- full-registry IPC actor (small/medium w): the ProcessPoolExecutor path -----------------------
+#
+# For small/medium worker counts the all-inherit registry (every worker inherits every inbox) is the
+# fast, simplest IPC path — a ``ProcessPoolExecutor`` whose initializer hands each worker the full
+# registry of SimpleQueue inboxes. The O(N²) inheritance is a non-issue while N is well under the
+# per-process fd limit; the executor switches to the bounded identity-pinned pool (PinnedProcessPool)
+# only when N approaches that limit (large many-core machines) — see ``ProcessExecutor._peer_ipc``.
+
 _peer_registry: dict[str, Any] | None = None
 
 
 def peer_pool_init(registry: dict[str, Any]) -> None:
-    """``ProcessPoolExecutor`` initializer: stash the inherited raw-queue registry in a process global
-    so each actor resolves its own inbox + the peers' outboxes by address — no Manager server."""
+    """``ProcessPoolExecutor`` initializer: stash the inherited full registry so each actor resolves
+    its own inbox + the peers' outboxes by address (no Manager server)."""
     global _peer_registry
     _peer_registry = registry
 
@@ -468,10 +581,9 @@ def pooled_peer_actor(
     emit: bool = False,
     profiler_factory: Callable[[], Any] | None = None,
 ) -> dict[str, int]:
-    """Picklable pool entry point: resolve this actor's inbox/outboxes from the inherited registry
-    (set by :func:`peer_pool_init`) keyed by ``address`` — the address is a cheap submit-arg string,
-    the queues are NOT passed per-submit — then delegate to :func:`ipc_peer_actor`. Any worker process
-    can serve any address because every worker inherited the full registry at spawn."""
+    """Picklable pool entry point: resolve this actor's inbox/outboxes from the inherited full registry
+    (set by :func:`peer_pool_init`) keyed by ``address``, then delegate to :func:`ipc_peer_actor`. Any
+    worker can serve any address because every worker inherited the full registry at spawn."""
     assert _peer_registry is not None, "peer_pool_init must run as the pool initializer"
     inbox = _peer_registry[address]
     outboxes = {a: q for a, q in _peer_registry.items() if a != address}
@@ -488,6 +600,42 @@ def pooled_peer_actor(
         steal=steal,
         emit=emit,
         profiler_factory=profiler_factory,
+    )
+
+
+def ipc_peer_actor(
+    address: str,
+    inbox: Any,
+    outboxes: dict[str, Any],
+    n: int,
+    bounds: list[int],
+    worker_addresses: tuple[str, ...],
+    process: Callable[[Partition, Any], Any],
+    combine: Callable[[Any, Any], Any],
+    items: Sequence[tuple[int, Partition]],
+    steal: bool = True,
+    emit: bool = False,
+    profiler_factory: Callable[[], Any] | None = None,
+) -> dict[str, int]:
+    """Module-level (picklable) IPC actor: build the queue transport from the ``inbox``/``outboxes``
+    handed in, then process + peer-reduce. The ``ProcessExecutor`` peer path uses
+    :func:`pinned_peer_actor` (transport from the per-worker init); this explicit-queue form is used to
+    exercise the actor in-process. Reuses the process resource cache across runs (file locality)."""
+    transport = QueueTransport(address, inbox, outboxes)
+    return process_and_reduce(
+        address,
+        transport,
+        n,
+        bounds,
+        worker_addresses,
+        process,
+        combine,
+        items,
+        _worker_proc_resources(),
+        steal=steal,
+        emit=emit,
+        profiler_factory=profiler_factory,
+        close_resources=False,
     )
 
 

@@ -152,12 +152,20 @@ Inter-worker comms: peer reduction + work-stealing (M38)
 
 By default (``comms="ipc"``) the reduction runs **across the workers, off the driver**. The seam is
 :class:`graphed_core.execution.WorkerTransport` — an addressable, non-blocking, best-effort message
-channel — with two backends: **IPC** (``QueueTransport`` over raw ``multiprocessing.Queue`` inboxes —
-one per address, created in the driver and *inherited* by every worker via the pool ``initializer``,
-so an actor resolves its inbox/outboxes from that registry by its address and there is **no
-``Manager`` server in the data path**) for a single machine, and **HTTP** (loopback ``http.server`` +
-a discovery handshake; ``HttpTransport``) as the path a real distributed scheduler reuses. Determinism
-is *not* the transport's job; it is the reduction protocol's.
+channel — with two backends: **IPC** (``QueueTransport`` over ``multiprocessing.SimpleQueue`` inboxes,
+one per address, no ``Manager`` server in the data path) for a single machine, and **HTTP** (loopback
+``http.server`` + a discovery handshake; ``HttpTransport``) as the path a real distributed scheduler
+reuses. Determinism is *not* the transport's job; it is the reduction protocol's.
+
+The IPC path has **two worker pools, chosen by the worker count vs the process fd limit**
+(``_use_pinned_pool``): for small/medium ``w`` a ``ProcessPoolExecutor`` whose workers each *inherit
+the full registry* (O(N²) fds — fine while N is well under the limit, and the fast common path); for
+large many-core machines (>128 cores) the ``PinnedProcessPool`` of **identity-pinned** workers that
+each inherit ONLY their inbox + the O(log N) outboxes of their *overlay* peers (reduction targets ∪ a
+symmetric **hypercube lifeline** graph ∪ driver, ``worker_outbox_addresses``), so the registry is
+O(N log N), not O(N²). Both bound work-stealing to the lifelines. (A *dynamic* cluster — workers
+joining/dying — needs a lazy-connect transport + multi-hop routing over this same overlay: the Phase-2
+distributed runtime, which reuses ``worker_outbox_addresses``.)
 
 * **Peer reduction** (``_peer.py``). Each worker owns a contiguous **leaf range** and reduces it with
   the lazy index tree (``_reduce.LazyReducer`` — the same fixed ``plan_tree``, computed by index
