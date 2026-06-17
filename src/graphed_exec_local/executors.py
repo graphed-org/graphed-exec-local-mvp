@@ -125,6 +125,10 @@ _proc_last_flush = 0.0
 _PROC_DRAIN_INTERVAL = 0.05  # seconds between worker->driver batch flushes
 _PROC_BUFFER_CAP = 50000  # bounded local buffer (drop-oldest on overflow)
 _PROFILE_FLUSH_INTERVAL = 1.0  # serialize the profiler at most ~1/s, never per task
+# Monitored peer runs drain trailing worker events while waiting for the futures to finish; a coarse
+# poll cadence here is a fixed per-run tail (the no-monitor path blocks on f.result() to avoid exactly
+# that). 2 ms keeps the tail negligible (~1 % on a sub-second pass) without busy-spinning.
+_PEER_MONITOR_DRAIN_POLL_S = 0.002
 
 # M37: every statistical profiler we start (thread-local or per-process) is registered here so a
 # single atexit handler can stop it — its background sampler thread must be joined before the worker's
@@ -1057,10 +1061,12 @@ class _ProcessExecutorBase(_BaseExecutor):
             self._last_peer_witness = [f.result() for f in futs]
             return cast(R, root)
         # Monitored: drain trailing events until every worker has finished (a late FINISHED/ERRORED,
-        # shipped after the root formed, must not be lost) — correctness of the event stream over the
-        # ~20 ms; a debugging dashboard run is not the latency-critical path.
+        # shipped after the root formed, must not be lost) — we cannot just block on f.result() here
+        # because a worker could still be shipping events, so we drain concurrently on a FINE cadence
+        # (_PEER_MONITOR_DRAIN_POLL_S). A coarse cadence was a ~20 ms tail per run = ~13 % of a
+        # sub-second interactive pass — the bulk of the measured monitor-attached overhead.
         while not all(f.done() for f in futs):
-            got = driver_t.recv(timeout=0.02)
+            got = driver_t.recv(timeout=_PEER_MONITOR_DRAIN_POLL_S)
             if got is not None:
                 self._forward_peer_events(got[1])
         for _sender, payload in driver_t.poll():
