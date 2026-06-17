@@ -51,8 +51,37 @@ its inbox/outboxes from that process-global registry by address (a cheap string 
 server, native pipes. Notebook ratification (8 files, 50 samples): peer-vs-hub gap **+23 % → +12.8 %**
 (and **p25 ≈ hub**, 159 vs 158 ms — at low contention peer now matches the hub). Cumulative with the
 tail-join fix: original +48 % → +12.8 %. New frozen ``test_pooled_transport.py`` covers the
-registry-resolved actor + persistent reuse/drain in-process. Remaining +12.8 % median is the
-contention tail (lockstep 4-way start) — left as documented, much smaller, p25-clean.
+registry-resolved actor + persistent reuse/drain in-process.
+
+### Residual saturation tail root cause + fix: SimpleQueue (no feeder threads)
+
+The remaining tail was investigated since **workers ≈ cores is the real HEP batch slot** (not workers
+< cores). A startup **stagger A/B first refuted a "lockstep" hypothesis** (staggering only *added*
+latency: +12.5 % → +23.5 % at 8 ms). py-spy then localised it: per-worker self-time is ~identical to
+the hub (no CPU sink), but the **peer worker carried 5 live threads vs the hub's 1** — raw
+``multiprocessing.Queue`` spawns a **feeder thread per queue** a process puts to, so a peer worker
+(driver + reduction peers) ran ~4 feeders. With workers ≈ cores those idle-but-scheduled threads add
+context-switch pressure that slows the workers' compute (invisible in self-time; shows only at
+saturation — explains why p25 == hub but the median lifts).
+
+**Fix:** ``PipeInbox`` — a ``multiprocessing.SimpleQueue`` (no feeder thread; ``put`` writes the pipe
+synchronously; the reader's ``poll(timeout)`` gives the timed receive) wrapped to the queue API.
+Peer worker threads **5 → 1**, like the hub. Result (per-worker work fixed, this 10-core box):
+
+| W | pre (mp.Queue) | post (SimpleQueue) |
+|---|---|---|
+| 2 | −5.5 % | +1.1 % |
+| 4 | **+23.7 %** | **−1.5 %** |
+| 8 | +12–17 % | +10.5 % |
+| 10 (workers == cores) | — | **+7.6 %** |
+
+The gap **closes with headroom (W=2,4)** and, crucially, **shrinks toward true saturation** (W=8→10:
++10.5 → +7.6 %) — the opposite of "scales poorly with more processes." The residual ~7.6 % at
+workers == cores is the inherent cost of *distributed* reduction: the hub offloads its N−1 combines
+onto the otherwise-idle driver core, the peer does them on the busy workers — the very property that
+lets peer scale past a single-driver bottleneck. Left as-is (chasing it would defeat the off-driver
+design); small and shrinking. (Still 10 cores here — true large-machine scaling untested; the O(N²)
+registry inheritance remains the item to watch at very large N.)
 
 ## What landed
 

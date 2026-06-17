@@ -58,7 +58,7 @@ from ._peer import (
     slice_items,
 )
 from ._reduce import plan_tree, running_fold, tree_reduce
-from ._transport import HttpTransport, QueueTransport, build_transports
+from ._transport import HttpTransport, PipeInbox, QueueTransport, build_transports
 
 R = TypeVar("R")
 _PEER_PENDING: Any = object()  # sentinel: the peer root has not arrived yet
@@ -72,10 +72,9 @@ def _drain_queue(q: Any) -> None:
 
 
 def _close_registry(registry: dict[str, Any]) -> None:
-    """Tear down a peer raw-queue registry (we're discarding — don't block on unflushed items)."""
+    """Tear down a peer inbox registry (PipeInbox/SimpleQueue — no feeder thread to join)."""
     for q in registry.values():
         with contextlib.suppress(Exception):
-            q.cancel_join_thread()
             q.close()
 
 
@@ -840,7 +839,7 @@ class ProcessExecutor(_BaseExecutor):
                 _drain_queue(q)
         else:
             self._close_peer()
-            registry = {a: ctx.Queue(maxsize=10000) for a in addrs}
+            registry = {a: PipeInbox(ctx) for a in addrs}  # SimpleQueue-backed: no per-queue feeder thread
             driver_t = QueueTransport(
                 "driver", registry["driver"], {a: registry[a] for a in addrs if a != "driver"}
             )

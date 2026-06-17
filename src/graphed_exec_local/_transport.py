@@ -5,9 +5,9 @@ Two interchangeable backends behind one interface — the seam peer reduction an
 and the seam a future *distributed* executor reuses unchanged:
 
 - :class:`QueueTransport` — **IPC** (the default). Per-endpoint inbox queue + a registry of peers'
-  inboxes. ``queue.Queue`` for the in-process / thread-pool case; a ``multiprocessing.Queue`` for the
-  process pool (queue-type-agnostic — it only uses ``put_nowait`` / ``get``). Sends are non-blocking
-  and drop on a full inbox (best-effort, off the data path — the R20.7 rule).
+  inboxes. ``queue.Queue`` for the in-process / thread-pool case; a :class:`PipeInbox`
+  (``multiprocessing.SimpleQueue``, **no feeder thread**) for the process pool (queue-type-agnostic —
+  it only uses ``put_nowait`` / ``get_nowait`` / ``get``). Sends are non-blocking off the data path.
 - :class:`HttpTransport` — **HTTP** over loopback. Each endpoint runs a tiny stdlib ``http.server`` in
   a daemon thread; ``send`` enqueues to a local outbound buffer that a background sender thread POSTs
   to the destination (so ``send`` stays non-blocking, exactly like the M37 dashboard client). Fully
@@ -34,10 +34,44 @@ from typing import Any
 _DEFAULT_MAXSIZE = 10000
 
 
+class PipeInbox:
+    """A cross-process inbox over ``multiprocessing.SimpleQueue``, adapted to the small ``queue.Queue``
+    API :class:`QueueTransport` uses (``put_nowait`` / ``get_nowait`` / ``get(timeout)``).
+
+    Why not ``multiprocessing.Queue``: that spawns a background **feeder thread per queue** in every
+    process that puts to it, so a peer worker writing to its driver + reduction peers ends up with
+    ~``log(N)`` extra threads. With workers ≈ cores (the normal HEP batch slot) those idle-but-scheduled
+    threads add context-switch pressure that measurably slows the workers' compute (py-spy: 5 threads/
+    worker vs the hub's 1). ``SimpleQueue`` has **no feeder thread** — ``put`` writes the pipe
+    synchronously under a lock — so a peer worker holds exactly one thread, like the hub. Our messages
+    are tiny and low-volume (O(log N) boundary partials), so the synchronous write never blocks on a
+    full pipe; we wait/poll the reader side, which exposes ``poll(timeout)``, for the timed receives."""
+
+    def __init__(self, ctx: Any) -> None:
+        self._q = ctx.SimpleQueue()
+
+    def put_nowait(self, item: object) -> None:
+        self._q.put(item)  # synchronous pipe write (no feeder); small msgs never fill the pipe buffer
+
+    def get_nowait(self) -> Any:
+        if self._q._reader.poll():
+            return self._q.get()
+        raise queue.Empty
+
+    def get(self, timeout: float | None = None) -> Any:
+        if self._q._reader.poll(timeout):
+            return self._q.get()
+        raise queue.Empty
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._q.close()
+
+
 class QueueTransport:
     """IPC transport: a per-endpoint inbox queue plus a registry of peers' inboxes. ``queue.Queue``
-    (threads / in-process) or ``multiprocessing.Queue`` (processes) — it only calls ``put_nowait`` /
-    ``get``, so the queue type is the caller's choice."""
+    (threads / in-process) or :class:`PipeInbox` (processes) — it only calls ``put_nowait`` /
+    ``get_nowait`` / ``get``, so the queue type is the caller's choice."""
 
     def __init__(self, address: str, inbox: Any, outboxes: dict[str, Any]) -> None:
         self.address = address
