@@ -5,6 +5,30 @@ Scope deviation (recorded): the plan §F lists work-stealing + distributed execu
 reduction + work-stealing** into MVP, keeping the executor single-machine but building the transport
 seam so a future distributed executor reuses it unchanged. Root prompt **R21** binds this.
 
+## Post-M38 perf fix: the peer collection tail-join (2026-06-16)
+
+Owner reported a perceived "work-stealing regression in IPC mode". Investigated by replicating the
+ADL notebook's cell-32 benchmark (8 queries, one combined plan, persistent 4-worker pool, warm + 50
+samples) and sweeping configs (`coffea-benchmarks-graphed-mvp/bench_*.py`). **Measured, not assumed
+(R0.11):**
+
+- **Stealing is NOT the cause.** `steal=True` ≈ `steal=False` within noise (±2%) in every mode
+  (no-monitor / dashboard / dashboard+profile); `steals=0` on balanced loads; the steal-loop's
+  coordination cost is ~3 ms. Lengthening the steal poll would not help (and slightly hurts the tail).
+- **The regression is peer-vs-hub** (the default flip): +48 % at 8 files, +7.6 % at 32 files — a
+  roughly FIXED per-run overhead that amortizes at scale.
+- **Decomposed** (1 leaf/worker, shared-wall-clock instrumentation, since reverted): dispatch+setup
+  4 ms, cross-worker reduce 2 ms, compute 111 ms — i.e. coordination is negligible. The consistent,
+  removable cost was the **driver tail-join**: after the root was already in hand, `_collect_peer`
+  polled ``f.done()`` on a 20 ms cadence waiting for workers to notice the ``done`` broadcast (~25-30 ms
+  every run). **Fix:** on the no-monitor fast path, block on the futures' completion (woken instantly)
+  instead of polling. A/B (same session, stash): peer 249.7 → 224.1 ms (−25.6 ms); gap +48 % → +23 %.
+  `open_once` is warm (open-count stable across runs — not a re-open issue).
+- **Residual ~40 ms** (peer compute makespan > hub) is **contention-sensitive** — near-zero on a quiet
+  machine (a low-load timeline showed peer 179 ≈ hub 170 ms), inflating under load (peer's lockstep
+  4-way start vs the hub's staggered dynamic dispatch). Needs py-spy/perf to pin before touching the
+  IPC backend; tracked as a follow-up, NOT the reduction path.
+
 ## What landed
 
 - **Transport seam** in `graphed_core.execution.WorkerTransport` (the exec-protocol home): an

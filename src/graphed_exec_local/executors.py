@@ -933,8 +933,18 @@ class ProcessExecutor(_BaseExecutor):
                 driver_t.broadcast(("done",))
                 raise TimeoutError("peer reduction did not produce a root within 300s")
         driver_t.broadcast(("done",))
-        # drain trailing monitor events until every worker has finished (else late FINISHED/ERRORED
-        # events, shipped after the root formed, would be lost).
+        if self.monitor is None:
+            # Fast path (no monitor): workers see ``done`` immediately (the transport wakes on the
+            # message) and return, so BLOCK on the futures' completion instead of polling ``f.done()``
+            # on a 20 ms cadence. That poll granularity was a fixed ~20-30 ms tail on EVERY run — under
+            # 1 % of a long job but ~15 % of a sub-second interactive pass (the measured peer-vs-hub
+            # regression on the ADL benchmark was almost entirely this join). ``f.result()`` is woken
+            # the instant a worker finishes and re-raises a worker error intact (M6).
+            self._last_peer_witness = [f.result() for f in futs]
+            return cast(R, root)
+        # Monitored: drain trailing events until every worker has finished (a late FINISHED/ERRORED,
+        # shipped after the root formed, must not be lost) — correctness of the event stream over the
+        # ~20 ms; a debugging dashboard run is not the latency-critical path.
         while not all(f.done() for f in futs):
             got = driver_t.recv(timeout=0.02)
             if got is not None:
