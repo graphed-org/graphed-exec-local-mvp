@@ -29,7 +29,7 @@ from graphed_exec_local._peer import (
 from graphed_exec_local._pinned_pool import PinnedProcessPool, _pinned_loop
 from graphed_exec_local._reduce import tree_reduce
 from graphed_exec_local._transport import QueueTransport
-from graphed_exec_local.executors import ProcessExecutor
+from graphed_exec_local.executors import PinnedPoolExecutor
 
 
 def _cat(a: str, b: str) -> str:
@@ -175,12 +175,11 @@ def _zero() -> int:
     return 0
 
 
-def test_persistent_ipc_reuses_pinned_pool_across_runs(monkeypatch: pytest.MonkeyPatch) -> None:
-    # force the identity-pinned path (small w defaults to the full-registry pool below the fd threshold)
-    monkeypatch.setenv("GRAPHED_PEER_PINNED", "1")
+def test_persistent_ipc_reuses_pinned_pool_across_runs() -> None:
+    # PinnedPoolExecutor uses the identity-pinned pool explicitly (no env override, no silent switch)
     tasks = tuple(Task(i, Partition(f"p{i}", "Events", i, i + 1)) for i in range(8))
     plan = Plan(process=_count, combine=_add, empty=_zero, tasks=tasks)
-    with ProcessExecutor(max_workers=4, persistent=True, comms="ipc", steal=True) as ex:
+    with PinnedPoolExecutor(max_workers=4, persistent=True, comms="ipc", steal=True) as ex:
         r1 = ex.run(plan).value
         pool1 = ex._peer_pool
         assert isinstance(pool1, PinnedProcessPool)  # the identity-pinned pool, not the full-registry one

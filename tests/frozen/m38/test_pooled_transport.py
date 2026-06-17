@@ -24,7 +24,7 @@ from graphed_exec_local._peer import (
 )
 from graphed_exec_local._reduce import tree_reduce
 from graphed_exec_local._transport import QueueTransport
-from graphed_exec_local.executors import ProcessExecutor
+from graphed_exec_local.executors import ProcessPoolExecutor
 
 
 def _cat(a: str, b: str) -> str:
@@ -101,11 +101,11 @@ def _zero() -> int:
 
 
 def test_persistent_ipc_reuses_pool_and_registry_across_runs() -> None:
-    """A persistent IPC executor reuses its worker pool + raw-queue registry on the second run (spawn
-    paid once) and drains any straggler first — same result both runs, no Manager involved."""
+    """A persistent full-registry IPC executor reuses its worker pool + raw-queue registry on the second
+    run (spawn paid once) and drains any straggler first — same result both runs, no Manager involved."""
     tasks = tuple(Task(i, Partition(f"p{i}", "Events", i, i + 1)) for i in range(8))
     plan = Plan(process=_count, combine=_add, empty=_zero, tasks=tasks)
-    with ProcessExecutor(max_workers=4, persistent=True, comms="ipc", steal=True) as ex:
+    with ProcessPoolExecutor(max_workers=4, persistent=True, comms="ipc", steal=True) as ex:
         r1 = ex.run(plan).value
         pool1 = ex._peer_pool
         registry1 = ex._peer_registry
@@ -113,3 +113,19 @@ def test_persistent_ipc_reuses_pool_and_registry_across_runs() -> None:
         assert ex._peer_pool is pool1  # witness: the pool was REUSED, not respawned
         assert ex._peer_registry is registry1  # ... and so was the inherited queue registry
     assert r1 == r2 == 8  # every leaf counted once, both runs
+
+
+def test_full_registry_warns_when_fd_budget_exceeded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ProcessPoolExecutor WARNS (recommending PinnedPoolExecutor) rather than silently switching pools
+    when the full-registry fd footprint would strain the per-process limit. We force the predicate
+    ``_exceeds_fd_budget`` True (it is exercised for real on every normal small-w run, returning False);
+    this isolates the warning *wiring* without needing to exhaust the OS fd limit on the test host."""
+    monkeypatch.setattr("graphed_exec_local.executors._exceeds_fd_budget", lambda _w: True)
+    tasks = tuple(Task(i, Partition(f"p{i}", "Events", i, i + 1)) for i in range(4))
+    plan = Plan(process=_count, combine=_add, empty=_zero, tasks=tasks)
+    # no silent switch — it still runs on the full-registry pool, just warns
+    with (
+        pytest.warns(UserWarning, match="PinnedPoolExecutor"),
+        ProcessPoolExecutor(max_workers=2, comms="ipc", steal=False) as ex,
+    ):
+        assert ex.run(plan).value == 4

@@ -21,18 +21,21 @@ import queue
 import sys
 import threading
 import time
+import warnings
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import (
     FIRST_COMPLETED,
     Future,
-    ProcessPoolExecutor,
     ThreadPoolExecutor,
     as_completed,
     wait,
 )
 from concurrent.futures import (
     Executor as _PoolExecutor,
+)
+from concurrent.futures import (
+    ProcessPoolExecutor as _StdProcessPool,  # the stdlib pool; our public ProcessPoolExecutor wraps it
 )
 from multiprocessing.managers import SyncManager
 from typing import Any, TypeVar, cast
@@ -84,21 +87,20 @@ def _close_registry(registry: dict[str, Any]) -> None:
             q.close()
 
 
-def _use_pinned_pool(w: int) -> bool:
-    """Choose the IPC worker pool. The full-registry ProcessPoolExecutor path (every worker inherits
-    every inbox) is faster for small/medium ``w`` but costs ~``2*(w+1)`` fds per worker; switch to the
-    bounded identity-pinned pool (O(log N) inheritance) before that approaches the per-process fd limit
-    — i.e. on large many-core machines (>128 cores). ``GRAPHED_PEER_PINNED`` forces the choice (tests)."""
-    forced = os.environ.get("GRAPHED_PEER_PINNED")
-    if forced is not None:
-        return forced not in ("", "0", "false", "False")
+def _exceeds_fd_budget(w: int) -> bool:
+    """Would a full-registry IPC pool of ``w`` workers strain the per-process fd limit? Each worker in
+    :class:`ProcessPoolExecutor` inherits every inbox (~``2*(w+1)`` fds), so the registry is O(N²) in
+    fds; on large many-core machines (>~128 cores, or any low ``RLIMIT_NOFILE``) that approaches the
+    limit. This is advisory only — it drives a warning that recommends :class:`PinnedPoolExecutor`
+    (whose bounded O(log N) overlay inherits ~``log w`` fds per worker); it never switches pools
+    silently. The user picks the executor explicitly."""
     if sys.platform == "win32":  # no POSIX RLIMIT; Windows fd/handle limits are high (CRT default 512)
         soft = 512
     else:
         import resource  # noqa: PLC0415 — POSIX only (sys.platform narrows this off Windows for mypy)
 
         soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-    return 2 * (w + 1) + 64 > soft // 2  # full-registry fds would exceed half the limit -> go bounded
+    return 2 * (w + 1) + 64 > soft // 2  # full-registry fds would exceed half the limit
 
 
 # ---- per-worker resources --------------------------------------------------
@@ -763,15 +765,23 @@ class ThreadExecutor(_BaseExecutor):
             self._last_peer_witness = [witness[a] for a in worker_addrs if a in witness]
 
 
-class ProcessExecutor(_BaseExecutor):
-    """Process-pool executor: spawn-based worker processes (cross-platform + free-threaded-safe), each
-    with its own ``open_once`` resources. The Plan ``process`` callable and its partials must be
+class _ProcessExecutorBase(_BaseExecutor):
+    """Shared process-pool machinery: spawn-based worker processes (cross-platform + free-threaded-safe),
+    each with its own ``open_once`` resources. The Plan ``process`` callable and its partials must be
     picklable; a remote ``StageError`` round-trips to the driver intact.
+
+    The two public process executors differ ONLY in which pool peer-reduction IPC uses, selected by the
+    class attribute ``_peer_pool_is_pinned`` (no silent runtime switch): :class:`ProcessPoolExecutor`
+    (full-registry stdlib pool) vs :class:`PinnedPoolExecutor` (identity-pinned, bounded O(log N)
+    overlay). Everything else — the main task pool, tree reduction, monitoring — is identical.
 
     M37: when a :class:`Monitor` is attached, workers cannot reach the driver's monitor object, so
     they push events onto a bounded ``Manager().Queue()`` that a driver-side **collector daemon
     thread** drains and replays into the monitor. The queue is best-effort (drop-on-full) so
     instrumentation never back-pressures a worker."""
+
+    #: Which pool the peer-reduction IPC path builds. Subclasses set this; the base is never used directly.
+    _peer_pool_is_pinned: bool = False
 
     def __init__(
         self,
@@ -798,13 +808,13 @@ class ProcessExecutor(_BaseExecutor):
         self._collector: threading.Thread | None = None
         self._collector_stop: threading.Event | None = None
         # M38 persistent peer state: reused across run()s when persistent=True so the worker spawn is
-        # paid once, like the hub pool. The full-registry ProcessPoolExecutor path reuses on w; the
-        # identity-pinned path's topology depends on (n, w) so it also keys on n (a repeated plan never
-        # respawns either way).
-        self._peer_pool: ProcessPoolExecutor | PinnedProcessPool | None = None
+        # paid once, like the hub pool. The full-registry path reuses on w; the identity-pinned path's
+        # topology depends on (n, w) so it also keys on n (a repeated plan never respawns either way).
+        self._peer_pool: _StdProcessPool | PinnedProcessPool | None = None
         self._peer_nworkers = 0
         self._peer_n = 0
         self._peer_pinned = False  # which IPC path the live pool is (identity-pinned vs full-registry)
+        self._warned_fd_budget = False  # fire the full-registry fd-budget warning at most once
         self._peer_registry: dict[str, Any] | None = None  # SimpleQueue inbox per address
         self._peer_driver: QueueTransport | None = None
 
@@ -846,16 +856,24 @@ class ProcessExecutor(_BaseExecutor):
         items: dict[str, list[tuple[int, Partition]]],
         ctx: Any,
     ) -> R:
-        # IPC across processes, two pools chosen by _use_pinned_pool(w):
-        #  * full-registry ProcessPoolExecutor (small/medium w, the fast common path): every worker
-        #    inherits every SimpleQueue inbox (O(N²) fds — fine while N << the fd limit).
-        #  * identity-pinned PinnedProcessPool (large many-core machines): each worker inherits ONLY its
-        #    inbox + its O(log N) overlay peers (reduction targets + hypercube lifelines + driver), so
-        #    the registry is O(N log N) and stays under the per-process fd limit. Both bound stealing to
-        #    the lifelines. (A *dynamic* cluster — workers joining/dying — needs a lazy-connect transport
-        #    + multi-hop routing over this same overlay: the Phase-2 distributed runtime, which reuses
-        #    worker_outbox_addresses.)
-        pinned = _use_pinned_pool(w)
+        # IPC across processes. The pool is the executor's fixed choice (no silent switch):
+        #  * ProcessPoolExecutor (full-registry, the default): every worker inherits every SimpleQueue
+        #    inbox (O(N²) fds — fine while N << the fd limit).
+        #  * PinnedPoolExecutor (identity-pinned, large many-core machines): each worker inherits ONLY
+        #    its inbox + its O(log N) overlay peers (reduction targets + hypercube lifelines + driver),
+        #    so the registry is O(N log N) and stays under the per-process fd limit. Both bound stealing
+        #    to the lifelines. (A *dynamic* cluster — workers joining/dying — needs a lazy-connect
+        #    transport + multi-hop routing over this same overlay: the Phase-2 distributed runtime,
+        #    which reuses worker_outbox_addresses.)
+        pinned = self._peer_pool_is_pinned
+        if not pinned and not self._warned_fd_budget and _exceeds_fd_budget(w):
+            self._warned_fd_budget = True
+            warnings.warn(
+                f"ProcessPoolExecutor peer reduction inherits ~2*(w+1) queue fds per worker; with "
+                f"w={w} this likely exceeds the per-process file-descriptor limit on this machine. "
+                f"Use PinnedPoolExecutor for a bounded O(log N) overlay on large many-core machines.",
+                stacklevel=2,
+            )
         addrs = ("driver", *worker_addrs)
         reuse = (
             self._persistent
@@ -891,7 +909,7 @@ class ProcessExecutor(_BaseExecutor):
                 ]
                 pool = PinnedProcessPool(w, ctx, pinned_peer_init, init_args)
             else:
-                pool = ProcessPoolExecutor(
+                pool = _StdProcessPool(
                     max_workers=w, mp_context=ctx, initializer=peer_pool_init, initargs=(registry,)
                 )
             if self._persistent:
@@ -918,7 +936,7 @@ class ProcessExecutor(_BaseExecutor):
                     for i, a in enumerate(worker_addrs)
                 ]
             else:
-                fpool = cast("ProcessPoolExecutor", pool)
+                fpool = cast("_StdProcessPool", pool)
                 futs = [
                     fpool.submit(
                         pooled_peer_actor,
@@ -958,14 +976,14 @@ class ProcessExecutor(_BaseExecutor):
         reuse = (
             self._persistent
             and self._peer_pool is not None
-            and not self._peer_pinned  # HTTP always uses a plain ProcessPoolExecutor, never the pinned pool
+            and not self._peer_pinned  # HTTP always uses a plain stdlib pool, never the pinned pool
             and self._peer_nworkers == w
         )
         if reuse:
-            pool = cast("ProcessPoolExecutor", self._peer_pool)
+            pool = cast("_StdProcessPool", self._peer_pool)
         else:
             self._close_peer()
-            pool = ProcessPoolExecutor(max_workers=w, mp_context=ctx)
+            pool = _StdProcessPool(max_workers=w, mp_context=ctx)
             if self._persistent:
                 self._peer_pool, self._peer_nworkers = pool, w
         assert pool is not None
@@ -1052,7 +1070,7 @@ class ProcessExecutor(_BaseExecutor):
 
     def _pool(self) -> _PoolExecutor:
         factory = self.monitor.worker_profiler_factory() if self.monitor is not None else None
-        return ProcessPoolExecutor(
+        return _StdProcessPool(
             max_workers=self.max_workers,
             mp_context=multiprocessing.get_context("spawn"),
             initializer=_proc_init,
@@ -1166,3 +1184,40 @@ class ProcessExecutor(_BaseExecutor):
         self._broadcast_tokens[token] = None
         while len(self._broadcast_tokens) > _SHARED_CACHE_CAP:  # FIFO, lockstep with the workers
             self._broadcast_tokens.popitem(last=False)
+
+
+class ProcessPoolExecutor(_ProcessExecutorBase):
+    """Process executor whose peer-reduction IPC uses a **full-registry** worker pool (the stdlib
+    :class:`concurrent.futures.ProcessPoolExecutor`): every worker inherits every peer's queue via the
+    pool initializer. Simple and fast — the right default up to roughly the per-process file-descriptor
+    limit. Because inheritance is O(N²) in fds, on large many-core machines (>~128 cores, or any low
+    ``RLIMIT_NOFILE``) it warns and you should switch to :class:`PinnedPoolExecutor` instead. This is
+    the original M7 behaviour, now named explicitly so the pool choice is never hidden."""
+
+    _peer_pool_is_pinned = False
+
+
+class PinnedPoolExecutor(_ProcessExecutorBase):
+    """Process executor whose peer-reduction IPC uses an **identity-pinned** worker pool
+    (:class:`~graphed_exec_local._pinned_pool.PinnedProcessPool`): each worker is spawned once and
+    inherits ONLY its own inbox plus its O(log N) overlay peers (segment-tree reduction targets +
+    hypercube steal lifelines + the driver). The registry is therefore O(N log N), not O(N²), so it
+    stays under the per-process fd limit — the executor to pick for large many-core machines. Identical
+    results to :class:`ProcessPoolExecutor` (bit-for-bit), only the communication footprint differs."""
+
+    _peer_pool_is_pinned = True
+
+
+class ProcessExecutor(ProcessPoolExecutor):
+    """Deprecated alias for :class:`ProcessPoolExecutor` (the full-registry pool — its original M7
+    meaning). Kept for back-compat; pick :class:`ProcessPoolExecutor` or :class:`PinnedPoolExecutor`
+    explicitly so the IPC pool is visible at the call site rather than chosen silently."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        warnings.warn(
+            "ProcessExecutor is deprecated; use ProcessPoolExecutor (full-registry, the same behaviour) "
+            "or PinnedPoolExecutor (identity-pinned, bounded O(log N) overlay) explicitly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)

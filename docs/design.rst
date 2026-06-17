@@ -157,15 +157,25 @@ one per address, no ``Manager`` server in the data path) for a single machine, a
 ``http.server`` + a discovery handshake; ``HttpTransport``) as the path a real distributed scheduler
 reuses. Determinism is *not* the transport's job; it is the reduction protocol's.
 
-The IPC path has **two worker pools, chosen by the worker count vs the process fd limit**
-(``_use_pinned_pool``): for small/medium ``w`` a ``ProcessPoolExecutor`` whose workers each *inherit
-the full registry* (O(N²) fds — fine while N is well under the limit, and the fast common path); for
-large many-core machines (>128 cores) the ``PinnedProcessPool`` of **identity-pinned** workers that
-each inherit ONLY their inbox + the O(log N) outboxes of their *overlay* peers (reduction targets ∪ a
-symmetric **hypercube lifeline** graph ∪ driver, ``worker_outbox_addresses``), so the registry is
-O(N log N), not O(N²). Both bound work-stealing to the lifelines. (A *dynamic* cluster — workers
-joining/dying — needs a lazy-connect transport + multi-hop routing over this same overlay: the Phase-2
-distributed runtime, which reuses ``worker_outbox_addresses``.)
+The IPC path has **two worker pools, and you pick which by choosing the executor class** — there is no
+silent runtime switch. :class:`~graphed_exec_local.ProcessPoolExecutor` (the default; original M7
+behaviour) uses a full-registry pool: every worker *inherits the whole registry* (O(N²) fds — fine
+while N is well under the per-process fd limit, and the fast common path). :class:`~graphed_exec_local.PinnedPoolExecutor`
+uses a ``PinnedProcessPool`` of **identity-pinned** workers that each inherit ONLY their inbox + the
+O(log N) outboxes of their *overlay* peers (reduction targets + a symmetric **hypercube lifeline**
+graph + driver, ``worker_outbox_addresses``), so the registry is O(N log N), not O(N²). Both bound
+work-stealing to the lifelines, and both produce **bit-for-bit identical** results — only the
+communication footprint differs.
+
+**Which to use.** Default to ``ProcessPoolExecutor``: it is the simplest and is fastest up to roughly
+the fd limit. Reach for ``PinnedPoolExecutor`` on large many-core machines (>~128 cores, or any low
+``RLIMIT_NOFILE``), where the full registry's O(N²) descriptors would exhaust the limit. So you are not
+surprised, ``ProcessPoolExecutor`` *warns* (via the advisory predicate ``_exceeds_fd_budget``) and
+points you at ``PinnedPoolExecutor`` when its worker count would strain the budget — it warns rather
+than switching, so the pool in use is always the one named at the call site. ``ProcessExecutor`` remains
+as a **deprecated alias** for ``ProcessPoolExecutor``. (A *dynamic* cluster — workers joining/dying —
+needs a lazy-connect transport + multi-hop routing over this same overlay: the Phase-2 distributed
+runtime, which reuses ``worker_outbox_addresses``.)
 
 * **Peer reduction** (``_peer.py``). Each worker owns a contiguous **leaf range** and reduces it with
   the lazy index tree (``_reduce.LazyReducer`` — the same fixed ``plan_tree``, computed by index

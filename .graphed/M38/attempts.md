@@ -1,5 +1,21 @@
 # M38 — inter-worker comms, peer reduction, work-stealing (attempts log)
 
+> **freeze-M38-6 (2026-06-17):** sanctioned refreeze of the two IPC-pool transport tests, on the project
+> owner's directive to make the pool choice **explicit** rather than a silent runtime switch. The P7
+> overlay work had `ProcessExecutor` pick the full-registry vs identity-pinned pool internally (via
+> `_use_pinned_pool(w)` + a `GRAPHED_PEER_PINNED` env override), which is opaque at the call site. Split
+> into two public executors — `ProcessPoolExecutor` (full-registry, the default = original M7 behaviour)
+> and `PinnedPoolExecutor` (identity-pinned, bounded O(log N) overlay) — sharing all machinery via
+> `_ProcessExecutorBase` (the only difference is the class attr `_peer_pool_is_pinned`). `ProcessExecutor`
+> stays as a **deprecated alias** for `ProcessPoolExecutor` (17 frozen files use the name; warns on
+> construction). The silent switch is gone; the fd-limit predicate is repurposed (`_exceeds_fd_budget`,
+> no env override) to **warn** — recommending `PinnedPoolExecutor` — when a full-registry pool's worker
+> count would strain the per-process fd limit. Frozen edits, both sanctioned: `test_pooled_transport.py`
+> now targets `ProcessPoolExecutor` explicitly (+ a new non-vacuous test that the warning fires and the
+> run still proceeds — no silent switch); `test_pinned_transport.py` targets `PinnedPoolExecutor`
+> explicitly (env override dropped). No assertion weakened. Notebook benchmark unchanged (the default
+> path is byte-for-byte the prior full-registry path).
+
 > **freeze-M38-5 (2026-06-16):** sanctioned refreeze of `test_peer_robustness.py` only — the profiling
 > witness `_spin` was a pure-Python busy loop holding the GIL, which intermittently starved the
 > GIL-needing off-thread sampler to ZERO samples on slow py3.14 macOS/Windows CI (a timing-flaky
@@ -232,8 +248,9 @@ pool kicks in only when it would approach it).
 
 ## Gates
 
-`tests/frozen/m38` green on both backends + both IPC pools; frozen coverage ≥90 % (line+branch);
-ruff + ruff format + mypy --strict clean; sphinx -W. Freeze tag `freeze-M38-4`.
+`tests/frozen/m38` green on both backends + both IPC pools (`ProcessPoolExecutor` full-registry +
+`PinnedPoolExecutor` identity-pinned, chosen explicitly); frozen coverage ≥90 % (line+branch); ruff +
+ruff format + mypy --strict clean; sphinx -W. Freeze tag `freeze-M38-6`.
 
 ## Deferred (Phase-2 within M38)
 
