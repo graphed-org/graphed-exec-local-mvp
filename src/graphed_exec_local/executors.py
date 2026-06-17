@@ -1062,11 +1062,15 @@ class _ProcessExecutorBase(_BaseExecutor):
             return cast(R, root)
         # Monitored: drain trailing events until every worker has finished (a late FINISHED/ERRORED,
         # shipped after the root formed, must not be lost) — we cannot just block on f.result() here
-        # because a worker could still be shipping events, so we drain concurrently on a FINE cadence
-        # (_PEER_MONITOR_DRAIN_POLL_S). A coarse cadence was a ~20 ms tail per run = ~13 % of a
-        # sub-second interactive pass — the bulk of the measured monitor-attached overhead.
+        # because a worker could still be shipping events, so we drain concurrently. The IPC transport
+        # write is synchronous (a worker's trailing telemetry is readable the instant it returns), so a
+        # FINE cadence has no tail: a coarse cadence was a ~20 ms over-wait per run = ~13 % of a
+        # sub-second interactive pass, the bulk of the measured monitor-attached overhead. HTTP delivers
+        # asynchronously (a worker's end-of-run profile POST can still be in flight when its future
+        # completes), so it keeps the coarse grace to let that final POST land before we stop draining.
+        drain_poll = 0.02 if isinstance(driver_t, HttpTransport) else _PEER_MONITOR_DRAIN_POLL_S
         while not all(f.done() for f in futs):
-            got = driver_t.recv(timeout=_PEER_MONITOR_DRAIN_POLL_S)
+            got = driver_t.recv(timeout=drain_poll)
             if got is not None:
                 self._forward_peer_events(got[1])
         for _sender, payload in driver_t.poll():
