@@ -152,9 +152,12 @@ Inter-worker comms: peer reduction + work-stealing (M38)
 
 By default (``comms="ipc"``) the reduction runs **across the workers, off the driver**. The seam is
 :class:`graphed_core.execution.WorkerTransport` — an addressable, non-blocking, best-effort message
-channel — with two backends: **IPC** (queues; ``QueueTransport``) for a single machine, and **HTTP**
-(loopback ``http.server`` + a discovery handshake; ``HttpTransport``) as the path a real distributed
-scheduler reuses. Determinism is *not* the transport's job; it is the reduction protocol's.
+channel — with two backends: **IPC** (``QueueTransport`` over raw ``multiprocessing.Queue`` inboxes —
+one per address, created in the driver and *inherited* by every worker via the pool ``initializer``,
+so an actor resolves its inbox/outboxes from that registry by its address and there is **no
+``Manager`` server in the data path**) for a single machine, and **HTTP** (loopback ``http.server`` +
+a discovery handshake; ``HttpTransport``) as the path a real distributed scheduler reuses. Determinism
+is *not* the transport's job; it is the reduction protocol's.
 
 * **Peer reduction** (``_peer.py``). Each worker owns a contiguous **leaf range** and reduces it with
   the lazy index tree (``_reduce.LazyReducer`` — the same fixed ``plan_tree``, computed by index

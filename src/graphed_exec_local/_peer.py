@@ -419,9 +419,10 @@ def ipc_peer_actor(
     emit: bool = False,
     profiler_factory: Callable[[], Any] | None = None,
 ) -> dict[str, int]:
-    """Module-level (picklable) IPC actor for ``ProcessExecutor``: build the queue transport from the
-    Manager-queue inbox/outboxes handed in, then process + peer-reduce. Reuses the process resource
-    cache across runs (file locality for a persistent pool)."""
+    """Module-level (picklable) IPC actor: build the queue transport from the ``inbox``/``outboxes``
+    handed in, then process + peer-reduce. The ``ProcessExecutor`` reaches this via
+    :func:`pooled_peer_actor` (registry-resolved queues); callers may also pass queues explicitly.
+    Reuses the process resource cache across runs (file locality for a persistent pool)."""
     transport = QueueTransport(address, inbox, outboxes)
     return process_and_reduce(
         address,
@@ -437,6 +438,56 @@ def ipc_peer_actor(
         emit=emit,
         profiler_factory=profiler_factory,
         close_resources=False,
+    )
+
+
+# Per-WORKER-PROCESS inbox/outbox registry, INHERITED via the pool initializer (``peer_pool_init``)
+# rather than handed in as picklable Manager proxies. This removes the ``multiprocessing.Manager``
+# *server* process the IPC path used to route every queue op through — py-spy showed that server
+# consuming ~30 % of sampled thread-time as a socket-RPC hub, contention that inflated the workers'
+# compute under load. Raw ``mp.Queue``s instead talk worker<->worker over native pipes.
+_peer_registry: dict[str, Any] | None = None
+
+
+def peer_pool_init(registry: dict[str, Any]) -> None:
+    """``ProcessPoolExecutor`` initializer: stash the inherited raw-queue registry in a process global
+    so each actor resolves its own inbox + the peers' outboxes by address — no Manager server."""
+    global _peer_registry
+    _peer_registry = registry
+
+
+def pooled_peer_actor(
+    address: str,
+    n: int,
+    bounds: list[int],
+    worker_addresses: tuple[str, ...],
+    process: Callable[[Partition, Any], Any],
+    combine: Callable[[Any, Any], Any],
+    items: Sequence[tuple[int, Partition]],
+    steal: bool = True,
+    emit: bool = False,
+    profiler_factory: Callable[[], Any] | None = None,
+) -> dict[str, int]:
+    """Picklable pool entry point: resolve this actor's inbox/outboxes from the inherited registry
+    (set by :func:`peer_pool_init`) keyed by ``address`` — the address is a cheap submit-arg string,
+    the queues are NOT passed per-submit — then delegate to :func:`ipc_peer_actor`. Any worker process
+    can serve any address because every worker inherited the full registry at spawn."""
+    assert _peer_registry is not None, "peer_pool_init must run as the pool initializer"
+    inbox = _peer_registry[address]
+    outboxes = {a: q for a, q in _peer_registry.items() if a != address}
+    return ipc_peer_actor(
+        address,
+        inbox,
+        outboxes,
+        n,
+        bounds,
+        worker_addresses,
+        process,
+        combine,
+        items,
+        steal=steal,
+        emit=emit,
+        profiler_factory=profiler_factory,
     )
 
 

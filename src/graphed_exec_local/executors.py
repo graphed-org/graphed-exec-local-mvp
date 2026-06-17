@@ -51,8 +51,9 @@ from graphed_debug import StageError
 from ._peer import (
     http_driver_handshake,
     http_peer_actor,
-    ipc_peer_actor,
     make_bounds,
+    peer_pool_init,
+    pooled_peer_actor,
     process_and_reduce,
     slice_items,
 )
@@ -61,6 +62,22 @@ from ._transport import HttpTransport, QueueTransport, build_transports
 
 R = TypeVar("R")
 _PEER_PENDING: Any = object()  # sentinel: the peer root has not arrived yet
+
+
+def _drain_queue(q: Any) -> None:
+    """Discard any straggler messages left in a reused peer inbox (a clean run leaves none)."""
+    with contextlib.suppress(Exception):
+        while True:
+            q.get_nowait()
+
+
+def _close_registry(registry: dict[str, Any]) -> None:
+    """Tear down a peer raw-queue registry (we're discarding — don't block on unflushed items)."""
+    for q in registry.values():
+        with contextlib.suppress(Exception):
+            q.cancel_join_thread()
+            q.close()
+
 
 # ---- per-worker resources --------------------------------------------------
 _thread_local = threading.local()
@@ -758,22 +775,20 @@ class ProcessExecutor(_BaseExecutor):
         self._event_q: object | None = None
         self._collector: threading.Thread | None = None
         self._collector_stop: threading.Event | None = None
-        # M38 persistent peer state: reused across run()s when persistent=True so the worker spawn AND
-        # (for IPC) the Manager spawn are paid once, exactly like the hub pool — the fair-benchmark path.
+        # M38 persistent peer state: reused across run()s when persistent=True so the worker spawn is
+        # paid once, exactly like the hub pool — the fair-benchmark path.
         self._peer_pool: ProcessPoolExecutor | None = None
         self._peer_nworkers = 0
-        self._peer_mgr: SyncManager | None = None
-        self._peer_inboxes: dict[str, Any] | None = None
+        self._peer_registry: dict[str, Any] | None = None  # raw mp.Queue per address, inherited by workers
         self._peer_driver: QueueTransport | None = None
 
     def _close_peer(self) -> None:
         if self._peer_pool is not None:
             self._peer_pool.shutdown(wait=True)
             self._peer_pool = None
-        if self._peer_mgr is not None:
-            self._peer_mgr.shutdown()
-            self._peer_mgr = None
-        self._peer_inboxes = None
+        if self._peer_registry is not None:
+            _close_registry(self._peer_registry)
+            self._peer_registry = None
         self._peer_driver = None
         self._peer_nworkers = 0
 
@@ -803,42 +818,45 @@ class ProcessExecutor(_BaseExecutor):
         items: dict[str, list[tuple[int, Partition]]],
         ctx: Any,
     ) -> R:
-        # IPC across processes: Manager().Queue() inboxes are picklable proxies, so each worker's
-        # inbox + its peer outboxes are handed in as submit args; the worker builds its QueueTransport.
-        # persistent=True reuses the pool + Manager + inboxes across run()s (spawn paid once, like hub).
+        # IPC across processes: a registry of raw mp.Queues (one inbox per address) is created in the
+        # driver and INHERITED by every worker via the pool initializer (peer_pool_init) — NOT handed in
+        # per-submit. Each actor resolves its inbox + peers' outboxes from that registry by its address
+        # (a cheap submit-arg string). This replaces the old Manager().Queue() proxies, eliminating the
+        # multiprocessing.Manager server process that routed every queue op as a socket-RPC (py-spy
+        # measured it consuming ~30% of sampled thread-time and inflating worker compute under load).
+        # persistent=True reuses the pool + registry across run()s (spawn paid once, like the hub).
         addrs = ("driver", *worker_addrs)
         reuse = (
             self._persistent
             and self._peer_pool is not None
             and self._peer_nworkers == w
-            and self._peer_inboxes is not None
+            and self._peer_registry is not None
             and self._peer_driver is not None
         )
         if reuse:
-            pool, inboxes, driver_t = self._peer_pool, self._peer_inboxes, self._peer_driver
-            assert driver_t is not None
-            for _ in driver_t.poll():  # clear any straggler before reuse (a clean run leaves none)
-                pass
+            pool, registry, driver_t = self._peer_pool, self._peer_registry, self._peer_driver
+            assert registry is not None and driver_t is not None
+            for q in registry.values():  # clear any straggler before reuse (a clean run leaves none)
+                _drain_queue(q)
         else:
             self._close_peer()
-            mgr = ctx.Manager()
-            inboxes = {a: mgr.Queue(maxsize=10000) for a in addrs}
+            registry = {a: ctx.Queue(maxsize=10000) for a in addrs}
             driver_t = QueueTransport(
-                "driver", inboxes["driver"], {a: inboxes[a] for a in addrs if a != "driver"}
+                "driver", registry["driver"], {a: registry[a] for a in addrs if a != "driver"}
             )
-            pool = ProcessPoolExecutor(max_workers=w, mp_context=ctx)
+            pool = ProcessPoolExecutor(
+                max_workers=w, mp_context=ctx, initializer=peer_pool_init, initargs=(registry,)
+            )
             if self._persistent:
-                self._peer_pool, self._peer_mgr, self._peer_inboxes = pool, mgr, inboxes
+                self._peer_pool, self._peer_registry = pool, registry
                 self._peer_driver, self._peer_nworkers = driver_t, w
-        assert pool is not None and inboxes is not None and driver_t is not None
+        assert pool is not None and registry is not None and driver_t is not None
         factory = self._peer_profiler_factory()
         try:
             futs = [
                 pool.submit(
-                    ipc_peer_actor,
+                    pooled_peer_actor,
                     a,
-                    inboxes[a],
-                    {p: inboxes[p] for p in addrs if p != a},
                     n,
                     bounds,
                     worker_addrs,
@@ -855,7 +873,7 @@ class ProcessExecutor(_BaseExecutor):
         finally:
             if not self._persistent:
                 pool.shutdown()
-                mgr.shutdown()
+                _close_registry(registry)
 
     def _peer_http(
         self,

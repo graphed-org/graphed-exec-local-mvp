@@ -25,9 +25,26 @@ samples) and sweeping configs (`coffea-benchmarks-graphed-mvp/bench_*.py`). **Me
   instead of polling. A/B (same session, stash): peer 249.7 → 224.1 ms (−25.6 ms); gap +48 % → +23 %.
   `open_once` is warm (open-count stable across runs — not a re-open issue).
 - **Residual ~40 ms** (peer compute makespan > hub) is **contention-sensitive** — near-zero on a quiet
-  machine (a low-load timeline showed peer 179 ≈ hub 170 ms), inflating under load (peer's lockstep
-  4-way start vs the hub's staggered dynamic dispatch). Needs py-spy/perf to pin before touching the
-  IPC backend; tracked as a follow-up, NOT the reduction path.
+  machine (a low-load timeline showed peer 179 ≈ hub 170 ms), inflating under load.
+
+### Residual root cause + fix: remove the Manager server (py-spy)
+
+py-spy (``--subprocesses``, same benchmark) showed the peer path ran **9 processes vs the hub's 6**,
+including a ``multiprocessing.Manager`` **server process consuming 31 % of sampled thread-time** doing
+pure socket-IPC (``_recv`` 76 % + ``accept`` 21 %, zero compute). The IPC ``QueueTransport`` used
+``Manager().Queue()`` proxies *because they are picklable* (passable as per-submit args); every queue
+op was a socket-RPC to that server, and the extra process + threads inflated worker compute under load.
+Workers ran the identical compute in both paths (awkward kernels / ``decompress`` / ``_carry``) — no
+peer-specific algorithm.
+
+**Fix:** create the inbox queues as **raw ``mp.Queue``** in the driver and **inherit** them in every
+worker via the pool ``initializer`` (``peer_pool_init``); the actor (``pooled_peer_actor``) resolves
+its inbox/outboxes from that process-global registry by address (a cheap string submit-arg). No Manager
+server, native pipes. Notebook ratification (8 files, 50 samples): peer-vs-hub gap **+23 % → +12.8 %**
+(and **p25 ≈ hub**, 159 vs 158 ms — at low contention peer now matches the hub). Cumulative with the
+tail-join fix: original +48 % → +12.8 %. New frozen ``test_pooled_transport.py`` covers the
+registry-resolved actor + persistent reuse/drain in-process. Remaining +12.8 % median is the
+contention tail (lockstep 4-way start) — left as documented, much smaller, p25-clean.
 
 ## What landed
 
