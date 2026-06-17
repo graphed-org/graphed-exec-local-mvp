@@ -90,13 +90,17 @@ def test_peer_emits_full_monitor_event_parity(executor_cls, kind) -> None:
 
 
 def _spin(partition: Partition, resources: object) -> int:
-    # busy on a WALL-CLOCK budget (not a fixed iteration count) so the 10ms off-thread sampler reliably
-    # lands samples even under GIL contention / a loaded machine — otherwise the witness is timing-flaky.
-    end = time.monotonic() + 0.08
+    # busy on a WALL-CLOCK budget, RELEASING THE GIL each step (``time.sleep``) so the 10ms off-thread
+    # sampler — which needs the GIL for ``sys._current_frames()`` — reliably lands samples. A pure-Python
+    # spin holds the GIL for the whole budget and can starve the sampler to ZERO samples on a slow/loaded
+    # machine (seen on py3.14 macOS/Windows CI); the real analysis releases the GIL in array kernels, so
+    # this mimics that. Per root-prompt R0.10a a witness must be a deterministic invariant, not timing.
+    end = time.monotonic() + 0.15
     s, i = 0.0, 0
     while time.monotonic() < end:
         s += (i % 7) ** 0.5
         i += 1
+        time.sleep(0.001)  # yield the GIL so the sampler thread can read this thread's stack
     return 1
 
 

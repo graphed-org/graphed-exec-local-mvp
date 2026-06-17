@@ -1,5 +1,13 @@
 # M38 — inter-worker comms, peer reduction, work-stealing (attempts log)
 
+> **freeze-M38-5 (2026-06-16):** sanctioned refreeze of `test_peer_robustness.py` only — the profiling
+> witness `_spin` was a pure-Python busy loop holding the GIL, which intermittently starved the
+> GIL-needing off-thread sampler to ZERO samples on slow py3.14 macOS/Windows CI (a timing-flaky
+> witness, R0.10a). Fixed by releasing the GIL each step (`time.sleep`) + a longer budget, so the
+> sampler reliably lands samples on any machine — mimicking how the real analysis releases the GIL in
+> array kernels. No assertion weakened. (Surfaced by the Manager-removal commit's CI; unrelated to that
+> change — the HTTP path it failed on was untouched.)
+
 Scope deviation (recorded): the plan §F lists work-stealing + distributed executors as Phase 2 and
 §A.4 scopes this repo single-machine. The project owner pulled **inter-worker communication + peer
 reduction + work-stealing** into MVP, keeping the executor single-machine but building the transport
