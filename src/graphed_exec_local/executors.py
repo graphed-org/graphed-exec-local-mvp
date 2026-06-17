@@ -18,6 +18,7 @@ import multiprocessing
 import os
 import pickle
 import queue
+import sys
 import threading
 import time
 from collections import OrderedDict, deque
@@ -91,12 +92,12 @@ def _use_pinned_pool(w: int) -> bool:
     forced = os.environ.get("GRAPHED_PEER_PINNED")
     if forced is not None:
         return forced not in ("", "0", "false", "False")
-    try:
-        import resource  # noqa: PLC0415 — POSIX only
+    if sys.platform == "win32":  # no POSIX RLIMIT; Windows fd/handle limits are high (CRT default 512)
+        soft = 512
+    else:
+        import resource  # noqa: PLC0415 — POSIX only (sys.platform narrows this off Windows for mypy)
 
         soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-    except Exception:  # pragma: no cover — Windows / no RLIMIT: assume the conservative macOS default
-        soft = 256
     return 2 * (w + 1) + 64 > soft // 2  # full-registry fds would exceed half the limit -> go bounded
 
 
