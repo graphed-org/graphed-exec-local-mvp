@@ -40,12 +40,9 @@ jobs:
           python -m pip install "${{ env.CORE }}" "${{ env.DEBUG }}" "${{ env.FRONTEND }}"
           python -m pip install "${{ env.NUMPY }}" "${{ env.AWKWARD }}" "${{ env.CORPUS }}"
           python -m pip install -e ".[dev]"
-      - name: Ruff
-        run: |
-          ruff check .
-          ruff format --check .
-      - name: Mypy (strict)
-        run: mypy
+      - uses: astral-sh/setup-uv@v5
+      - name: Lint + types (pre-commit hooks via prek)
+        run: uvx prek@0.4.5 run --all-files --show-diff-on-failure
       - name: Pytest + coverage gate (>=90%)
         run: pytest tests/frozen --cov=graphed_exec_local --cov-branch --cov-report=term-missing
 

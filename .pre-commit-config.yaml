@@ -1,0 +1,30 @@
+# Lint + type-check hooks, run by prek (https://github.com/j178/prek).
+#
+# These commands live here ONCE and are consumed by every gate: CI (`uvx prek run
+# --all-files`), the graphed-orchestrator pre-commit gate, and a developer's local
+# `prek install`. No more hand-rolled `ruff`/`mypy` shell chains duplicated per workflow.
+#
+# ruff and mypy are `system` hooks on purpose: they use the versions already installed in
+# the project's env (the `dev` extra, intentionally unpinned), so there is a single source
+# of truth for tool versions rather than a second set pinned here that could drift.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: ruff format
+        entry: ruff format --check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: mypy
+        name: mypy (strict)
+        entry: mypy
+        language: system
+        pass_filenames: false
+        always_run: true
