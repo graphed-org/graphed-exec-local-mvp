@@ -12,4 +12,5 @@ coverage.xml
 dist/
 build/
 _build/
+docs/generated/
 .DS_Store

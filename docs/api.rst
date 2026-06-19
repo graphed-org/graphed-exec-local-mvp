@@ -1,15 +1,12 @@
 API reference
 =============
 
-.. autoclass:: graphed_exec_local.ThreadExecutor
-   :members:
+This page is generated automatically from the package source by
+:mod:`sphinx.ext.autosummary`, so it always reflects the current public API. Follow a module link
+for its functions and classes.
 
-.. autoclass:: graphed_exec_local.ProcessExecutor
-   :members:
+.. autosummary::
+   :toctree: generated
+   :recursive:
 
-.. autoclass:: graphed_exec_local.LocalResources
-   :members:
-
-.. autofunction:: graphed_exec_local.plan_tree
-
-.. autofunction:: graphed_exec_local.tree_reduce
+   graphed_exec_local
